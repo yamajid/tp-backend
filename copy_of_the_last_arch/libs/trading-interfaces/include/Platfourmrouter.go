@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -178,27 +179,46 @@ func (r *PlatformRouter) PublishConfirmation(confirmation TradeConfirmation) {
 	// Convert confirmation status to string using the String() method
 	statusStr := confirmation.Status.String()
 
-	// Build JSON message manually to match C++ behavior
-	jsonBuilder := fmt.Sprintf(`{"session_id":"%s","client_order_id":"%s","status":"%s"`,
-		confirmation.SessionID,
-		confirmation.ClientOrderID,
-		statusStr)
+	// Check if this is a close operation confirmation
+	isCloseOperation := strings.HasPrefix(confirmation.ClientOrderID, "CLOSE_POSITIONS_") ||
+		strings.HasPrefix(confirmation.ClientOrderID, "PARTIAL_CLOSE_") ||
+		strings.HasPrefix(confirmation.ClientOrderID, "DELETE_ORDERS_")
 
-	// Add optional fields
-	if confirmation.TicketID != nil {
-		jsonBuilder += fmt.Sprintf(`,"ticket_id":%d`, *confirmation.TicketID)
-	}
+	var jsonBuilder string
+	if isCloseOperation {
+		// Use CamelCase keys for close operations
+		jsonBuilder = fmt.Sprintf(`{"sessionId":"%s","operationId":"%s","status":"%s"`,
+			confirmation.SessionID,
+			confirmation.ClientOrderID,
+			statusStr)
 
-	if confirmation.FilledPrice != nil {
-		jsonBuilder += fmt.Sprintf(`,"filled_price":%f`, *confirmation.FilledPrice)
-	}
+		// Add optional fields with CamelCase keys
+		if confirmation.ReasonMessage != nil {
+			jsonBuilder += fmt.Sprintf(`,"message":"%s"`, *confirmation.ReasonMessage)
+		}
+	} else {
+		// Use original keys for regular order confirmations
+		jsonBuilder = fmt.Sprintf(`{"session_id":"%s","client_order_id":"%s","status":"%s"`,
+			confirmation.SessionID,
+			confirmation.ClientOrderID,
+			statusStr)
 
-	if confirmation.ReasonMessage != nil {
-		jsonBuilder += fmt.Sprintf(`,"reason":"%s"`, *confirmation.ReasonMessage)
-	}
+		// Add optional fields
+		if confirmation.TicketID != nil {
+			jsonBuilder += fmt.Sprintf(`,"ticket_id":%d`, *confirmation.TicketID)
+		}
 
-	if confirmation.RawBrokerErrorCode != nil {
-		jsonBuilder += fmt.Sprintf(`,"error_code":%d`, *confirmation.RawBrokerErrorCode)
+		if confirmation.FilledPrice != nil {
+			jsonBuilder += fmt.Sprintf(`,"filled_price":%f`, *confirmation.FilledPrice)
+		}
+
+		if confirmation.ReasonMessage != nil {
+			jsonBuilder += fmt.Sprintf(`,"reason":"%s"`, *confirmation.ReasonMessage)
+		}
+
+		if confirmation.RawBrokerErrorCode != nil {
+			jsonBuilder += fmt.Sprintf(`,"error_code":%d`, *confirmation.RawBrokerErrorCode)
+		}
 	}
 
 	jsonBuilder += "}"
@@ -321,9 +341,17 @@ func (r *PlatformRouter) processOrderMessage(message string) error {
 	clientOrderID, _ := jsonData["client_order_id"].(string)
 	sessionID, _ := jsonData["session_id"].(string)
 
-	// Validate required fields
-	if msgType == "" || clientOrderID == "" || sessionID == "" {
-		err := fmt.Errorf("missing required order fields")
+	// Validate required fields (close commands don't need client_order_id)
+	if msgType == "" || sessionID == "" {
+		err := fmt.Errorf("missing required fields: type or session_id")
+		log.Printf("[PlatformRouter] %v", err)
+		return err
+	}
+
+	// Close commands don't require client_order_id
+	isCloseCommand := msgType == "CLOSE_POSITIONS" || msgType == "PARTIAL_CLOSE" || msgType == "DELETE_ORDERS"
+	if !isCloseCommand && clientOrderID == "" {
+		err := fmt.Errorf("missing required order fields: client_order_id required for non-close commands")
 		log.Printf("[PlatformRouter] %v", err)
 		return err
 	}
@@ -339,8 +367,17 @@ func (r *PlatformRouter) processOrderMessage(message string) error {
 	case "CANCEL_ORDER":
 		return r.processCancelOrder(jsonData, clientOrderID)
 
+	case "CLOSE_POSITIONS":
+		return r.processClosePositions(jsonData, sessionID)
+
+	case "PARTIAL_CLOSE":
+		return r.processPartialClose(jsonData, sessionID)
+
+	case "DELETE_ORDERS":
+		return r.processDeleteOrders(jsonData, sessionID)
+
 	default:
-		err := fmt.Errorf("unknown order type: %s", msgType)
+		err := fmt.Errorf("unknown message type: %s", msgType)
 		log.Printf("[PlatformRouter] %v", err)
 		return err
 	}
@@ -382,12 +419,24 @@ func (r *PlatformRouter) processSendOrder(jsonData map[string]interface{}, clien
 		order.TakeProfit = &tp
 	}
 
+	// Parse magic number from request
+	var requestMagic int64 = 0
+	if magicVal, ok := jsonData["magic_number"].(float64); ok {
+		requestMagic = int64(magicVal)
+	}
+
 	// Get magic number from session
-	if magic, exists := r.mt5Bridge.GetMagic(sessionID); exists {
-		order.Magic = magic
+	if sessionMagic, exists := r.mt5Bridge.GetMagic(sessionID); exists {
+		// Validate that request magic matches session magic (if provided)
+		if requestMagic != 0 && requestMagic != sessionMagic {
+			err := fmt.Errorf("[PlatformRouter] No session with magic number %d found", requestMagic)
+			log.Printf("[PlatformRouter] %v", err)
+			return err
+		}
+		order.Magic = sessionMagic
 	} else {
-		err :=  fmt.Errorf("[PlatformRouter] No magic assigned for session %s", sessionID)
-		return  err
+		err := fmt.Errorf("[PlatformRouter] No magic assigned for session %s", sessionID)
+		return err
 	}
 
 	// Validate order
@@ -455,11 +504,95 @@ func (r *PlatformRouter) processCancelOrder(jsonData map[string]interface{}, cli
 	return nil
 }
 
-// void ProcessOrderMessage(const std::string &message)
-// func (r *PlatformRouter) processOrderMessage(message string) {
-//     // Implementation goes here
+func (r *PlatformRouter) processClosePositions(jsonData map[string]interface{}, sessionID string) error {
+	log.Printf("[PlatformRouter] Processing CLOSE_POSITIONS for session: %s", sessionID)
 
-// }
+	// Get magic number from session (consistent with order processing)
+	magic, exists := r.mt5Bridge.GetMagic(sessionID)
+	if !exists {
+		return fmt.Errorf("no magic assigned for session %s", sessionID)
+	}
+
+	// Extract filters if present
+	filters := make(map[string]string)
+	if filtersData, exists := jsonData["filters"].(map[string]interface{}); exists {
+		for k, v := range filtersData {
+			if strVal, ok := v.(string); ok {
+				filters[k] = strVal
+			}
+		}
+	}
+
+	// Send close positions command to MT5 bridge
+	r.mt5Bridge.SendClosePositions(sessionID, magic, filters)
+	log.Printf("[PlatformRouter] Sent close positions to session: %s", sessionID)
+	return nil
+}
+
+func (r *PlatformRouter) processPartialClose(jsonData map[string]interface{}, sessionID string) error {
+	log.Printf("[PlatformRouter] Processing PARTIAL_CLOSE for session: %s", sessionID)
+
+	// Get magic number from session (consistent with order processing)
+	magic, exists := r.mt5Bridge.GetMagic(sessionID)
+	if !exists {
+		return fmt.Errorf("no magic assigned for session %s", sessionID)
+	}
+
+	// Extract close percent
+	closePercentFloat, ok := jsonData["close_percent"].(float64)
+	if !ok {
+		return fmt.Errorf("missing or invalid close_percent for PARTIAL_CLOSE")
+	}
+	closePercent := closePercentFloat
+
+	// Extract position ID (optional)
+	var positionID string
+	if posID, exists := jsonData["position_id"]; exists {
+		if strVal, ok := posID.(string); ok {
+			positionID = strVal
+		}
+	}
+
+	// Extract filters if present
+	filters := make(map[string]string)
+	if filtersData, exists := jsonData["filters"].(map[string]interface{}); exists {
+		for k, v := range filtersData {
+			if strVal, ok := v.(string); ok {
+				filters[k] = strVal
+			}
+		}
+	}
+
+	// Send partial close command to MT5 bridge
+	r.mt5Bridge.SendPartialClose(sessionID, magic, positionID, closePercent, filters)
+	log.Printf("[PlatformRouter] Sent partial close to session: %s", sessionID)
+	return nil
+}
+
+func (r *PlatformRouter) processDeleteOrders(jsonData map[string]interface{}, sessionID string) error {
+	log.Printf("[PlatformRouter] Processing DELETE_ORDERS for session: %s", sessionID)
+
+	// Get magic number from session (consistent with order processing)
+	magic, exists := r.mt5Bridge.GetMagic(sessionID)
+	if !exists {
+		return fmt.Errorf("no magic assigned for session %s", sessionID)
+	}
+
+	// Extract filters if present
+	filters := make(map[string]string)
+	if filtersData, exists := jsonData["filters"].(map[string]interface{}); exists {
+		for k, v := range filtersData {
+			if strVal, ok := v.(string); ok {
+				filters[k] = strVal
+			}
+		}
+	}
+
+	// Send delete orders command to MT5 bridge
+	r.mt5Bridge.SendDeleteOrders(sessionID, magic, filters)
+	log.Printf("[PlatformRouter] Sent delete orders to session: %s", sessionID)
+	return nil
+}
 
 // OrderType parseOrderType(const std::string &order_type_str)
 func (r *PlatformRouter) parseOrderType(orderTypeStr string) OrderType {

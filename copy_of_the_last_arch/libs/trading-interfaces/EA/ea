@@ -16,11 +16,15 @@ int HubPort = 5556;
 // Session ID - unique identifier for this EA instance
 string SessionID = "";
 
+// Magic number for this EA instance
+long EAMagic = 0;
+
 // Socket handle
 int socket = INVALID_HANDLE;
 
 // Receive buffer for handling partial messages
 string receiveBuffer = "";
+
 
 // Reconnection variables
 int reconnectionAttempts = 0;
@@ -111,7 +115,7 @@ void SendAccountInfo() {
                        "|MARGIN_FREE=" + DoubleToString(margin_free, 2) + "|\n";
    
    SendToHub(accountData);
-   Print("✓ Sent account info: Balance=", DoubleToString(balance, 2), ", Equity=", DoubleToString(equity, 2));
+    // Print("✓ Sent account info: Balance=", DoubleToString(balance, 2), ", Equity=", DoubleToString(equity, 2));
 }
 
 //+------------------------------------------------------------------+
@@ -123,6 +127,15 @@ int OnInit() {
    // Fixed session ID for testing
    SessionID = "ea_00";
    Print("Session ID: ", SessionID);
+   
+   // Load magic number from global variable
+   if(GlobalVariableCheck("MAGIC")) {
+      EAMagic = (long)GlobalVariableGet("MAGIC");
+      Print("Loaded magic number: ", EAMagic);
+   } else {
+      EAMagic = 0;
+      Print("No magic number found");
+   }
    
    // Create socket
    socket = SocketCreate();
@@ -142,7 +155,11 @@ int OnInit() {
    Print("Connected to MT5 Hub successfully");
    
    // Send HELLO handshake message
-   string hello = "HELLO;session_id=" + SessionID + "\n";
+   string hello = "HELLO;session_id=" + SessionID;
+   if(EAMagic > 0) {
+      hello += ";magic=" + IntegerToString(EAMagic);
+   }
+   hello += "\n";
    if(!SendToHub(hello)) {
       Print("ERROR: Failed to send HELLO handshake");
       SocketClose(socket);
@@ -253,7 +270,11 @@ void OnTimer() {
                   Print("Reconnected to MT5 Hub successfully");
                   
                   // Send HELLO handshake message
-                  string hello = "HELLO;session_id=" + SessionID + "\n";
+                  string hello = "HELLO;session_id=" + SessionID;
+                  if(EAMagic > 0) {
+                     hello += ";magic=" + IntegerToString(EAMagic);
+                  }
+                  hello += "\n";
                   if(SendToHub(hello)) {
                      // Send broker symbol metadata and account info
                      SendSymbolMetadata();
@@ -384,7 +405,13 @@ void ProcessMessages() {
 //+------------------------------------------------------------------+
 void ProcessCommand(string command) {
    // Identify message type
-   if(StringFind(command, "SEND_ORDER|") == 0) {
+   if(StringFind(command, "MAGIC|") == 0) {
+      long magic = StringToInteger(GetField(command, "magic"));
+      EAMagic = magic;
+      GlobalVariableSet("MAGIC", magic);
+      Print("Received and stored magic number: ", magic);
+   }
+   else if(StringFind(command, "SEND_ORDER|") == 0) {
       ProcessSendOrder(command);
    }
    else if(StringFind(command, "MODIFY_ORDER|") == 0) {
@@ -435,7 +462,7 @@ bool SendToHub(string message) {
       return false;
    }
    
-   Print("→ Sent: ", message);
+   // Print("→ Sent: ", message);
    return true;
 }
 
@@ -871,29 +898,64 @@ void ProcessCancelOrder(string message) {
 //+------------------------------------------------------------------+
 void ProcessClosePositions(string message) {
    long magic = StringToInteger(GetField(message, "MAGIC"));
+   string symbolFilter = GetField(message, "SYMBOL");
    string pnlFilter = GetField(message, "PNL");
    string sideFilter = GetField(message, "SIDE");
    string scope = GetField(message, "SCOPE");
    
-   Print("Closing positions: Magic=", magic, " PnL=", pnlFilter, " Side=", sideFilter, " Scope=", scope);
+   Print("Closing positions: Magic=", magic, " Symbol=", symbolFilter, " PnL=", pnlFilter, " Side=", sideFilter, " Scope=", scope);
    
    if(magic == 0) {
       Print("ERROR: Invalid magic number");
       return;
    }
    
+   // Debug: List all positions
+   Print("=== DEBUG: All positions ===");
+   for(int i = 0; i < PositionsTotal(); i++) {
+      if(PositionGetTicket(i) > 0) {
+         ulong ticket = PositionGetInteger(POSITION_TICKET);
+         string symbol = PositionGetString(POSITION_SYMBOL);
+         long posMagic = PositionGetInteger(POSITION_MAGIC);
+         double profit = PositionGetDouble(POSITION_PROFIT);
+         int posType = PositionGetInteger(POSITION_TYPE);
+         Print("Position[", i, "]: Ticket=", ticket, " Symbol=", symbol, " Magic=", posMagic, " Profit=", DoubleToString(profit, 2), " Type=", posType);
+      }
+   }
+   Print("=== END DEBUG ===");
+   
    int closedCount = 0;
    for(int i = PositionsTotal() - 1; i >= 0; i--) {
       if(PositionGetTicket(i) > 0) {
          long posMagic = PositionGetInteger(POSITION_MAGIC);
-         if(posMagic != magic) continue; // Filter by magic
+         if(posMagic != magic) {
+            Print("Skipping position ", i, " - magic mismatch: ", posMagic, " != ", magic);
+            continue; // Filter by magic
+         }
          
          // Apply filters
-         if(pnlFilter != "" && pnlFilter == "PROFIT" && PositionGetDouble(POSITION_PROFIT) <= 0) continue;
-         if(pnlFilter != "" && pnlFilter == "LOSS" && PositionGetDouble(POSITION_PROFIT) >= 0) continue;
-         if(sideFilter != "" && sideFilter == "BUY" && PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY) continue;
-         if(sideFilter != "" && sideFilter == "SELL" && PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_SELL) continue;
+         if(symbolFilter != "" && PositionGetString(POSITION_SYMBOL) != symbolFilter) {
+            Print("Skipping position ", i, " - symbol filter: ", PositionGetString(POSITION_SYMBOL), " != ", symbolFilter);
+            continue;
+         }
+         if(pnlFilter != "" && pnlFilter == "PROFIT" && PositionGetDouble(POSITION_PROFIT) <= 0) {
+            Print("Skipping position ", i, " - not profit: ", PositionGetDouble(POSITION_PROFIT));
+            continue;
+         }
+         if(pnlFilter != "" && pnlFilter == "LOSS" && PositionGetDouble(POSITION_PROFIT) >= 0) {
+            Print("Skipping position ", i, " - not loss: ", PositionGetDouble(POSITION_PROFIT));
+            continue;
+         }
+         if(sideFilter != "" && sideFilter == "BUY" && PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY) {
+            Print("Skipping position ", i, " - not BUY: ", PositionGetInteger(POSITION_TYPE));
+            continue;
+         }
+         if(sideFilter != "" && sideFilter == "SELL" && PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_SELL) {
+            Print("Skipping position ", i, " - not SELL: ", PositionGetInteger(POSITION_TYPE));
+            continue;
+         }
          
+         Print("Closing position ", i, " - matches filters");
          // Close position
          ulong ticket = PositionGetInteger(POSITION_TICKET);
          if(trade.PositionClose(ticket)) {
@@ -916,9 +978,10 @@ void ProcessClosePositions(string message) {
 //+------------------------------------------------------------------+
 void ProcessDeleteOrders(string message) {
    long magic = StringToInteger(GetField(message, "MAGIC"));
+   string symbolFilter = GetField(message, "SYMBOL");
    string scope = GetField(message, "SCOPE");
    
-   Print("Deleting orders: Magic=", magic, " Scope=", scope);
+   Print("Deleting orders: Magic=", magic, " Symbol=", symbolFilter, " Scope=", scope);
    
    if(magic == 0) {
       Print("ERROR: Invalid magic number");
@@ -930,6 +993,9 @@ void ProcessDeleteOrders(string message) {
       if(OrderGetTicket(i) > 0) {
          long orderMagic = OrderGetInteger(ORDER_MAGIC);
          if(orderMagic != magic) continue; // Filter by magic
+         
+         // Apply symbol filter
+         if(symbolFilter != "" && OrderGetString(ORDER_SYMBOL) != symbolFilter) continue;
          
          // Delete order
          ulong ticket = OrderGetTicket(i);
@@ -955,11 +1021,12 @@ void ProcessPartialClose(string message) {
    long magic = StringToInteger(GetField(message, "MAGIC"));
    ulong positionID = StringToInteger(GetField(message, "POSITION_ID"));
    double closePercent = StringToDouble(GetField(message, "CLOSE_PERCENT"));
+   string symbolFilter = GetField(message, "SYMBOL");
    string pnlFilter = GetField(message, "PNL");
    string sideFilter = GetField(message, "SIDE");
    string scope = GetField(message, "SCOPE");
    
-   Print("Partial closing positions: Magic=", magic, " PositionID=", positionID, " ClosePercent=", closePercent, " PnL=", pnlFilter, " Side=", sideFilter, " Scope=", scope);
+   Print("Partial closing positions: Magic=", magic, " PositionID=", positionID, " ClosePercent=", closePercent, " Symbol=", symbolFilter, " PnL=", pnlFilter, " Side=", sideFilter, " Scope=", scope);
    
    if(magic == 0 || closePercent <= 0 || closePercent > 100) {
       Print("ERROR: Invalid magic or close percent");
@@ -971,9 +1038,11 @@ void ProcessPartialClose(string message) {
    int partialClosedCount = 0;
    
    if(positionID > 0) {
+      Print("Checking specific position: ", positionID, " with magic: ", magic);
       // Close specific position
       if(PositionSelectByTicket(positionID)) {
          long posMagic = PositionGetInteger(POSITION_MAGIC);
+         Print("Position found, current magic: ", posMagic, " expected: ", magic);
          if(posMagic == magic) {
             string symbol = PositionGetString(POSITION_SYMBOL);
             double currentVolume = PositionGetDouble(POSITION_VOLUME);
@@ -982,22 +1051,32 @@ void ProcessPartialClose(string message) {
             // Enforce volume rules
             volumeToClose = NormalizeVolume(symbol, volumeToClose);
             
+            Print("Attempting to close volume: ", volumeToClose, " of ", currentVolume);
             if(volumeToClose > 0 && trade.PositionClosePartial(positionID, volumeToClose)) {
                partialClosedCount++;
                Print("✓ Partial closed position: ", positionID, " Volume: ", volumeToClose);
             } else {
-               Print("✗ Failed to partial close position: ", positionID);
+               Print("✗ Failed to partial close position: ", positionID, " Error: ", GetLastError());
             }
+         } else {
+            Print("Magic mismatch: position has ", posMagic, " expected ", magic);
          }
+      } else {
+         Print("Position ", positionID, " not found by PositionSelectByTicket");
       }
    } else {
+      Print("Checking all positions for partial close with magic: ", magic);
       // Close all matching positions
       for(int i = PositionsTotal() - 1; i >= 0; i--) {
          if(PositionGetTicket(i) > 0) {
             long posMagic = PositionGetInteger(POSITION_MAGIC);
-            if(posMagic != magic) continue;
+            if(posMagic != magic) {
+               Print("Skipping position ", i, " - magic mismatch");
+               continue;
+            }
             
             // Apply filters
+            if(symbolFilter != "" && PositionGetString(POSITION_SYMBOL) != symbolFilter) continue;
             if(pnlFilter != "" && pnlFilter == "PROFIT" && PositionGetDouble(POSITION_PROFIT) <= 0) continue;
             if(pnlFilter != "" && pnlFilter == "LOSS" && PositionGetDouble(POSITION_PROFIT) >= 0) continue;
             if(sideFilter != "" && sideFilter == "BUY" && PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY) continue;
@@ -1007,6 +1086,18 @@ void ProcessPartialClose(string message) {
             string symbol = PositionGetString(POSITION_SYMBOL);
             double currentVolume = PositionGetDouble(POSITION_VOLUME);
             double volumeToClose = (closePercent / 100.0) * currentVolume;
+            
+            // Ensure symbol is subscribed before closing
+            if(!EnsureSymbol(symbol)) {
+               Print("Skipping position ", ticket, " - symbol not available: ", symbol);
+               continue;
+            }
+            
+            // Reselect position after symbol selection
+            if(!PositionSelectByTicket(ticket)) {
+               Print("Failed to reselect position ", ticket, " after symbol selection");
+               continue;
+            }
             
             // Enforce volume rules
             volumeToClose = NormalizeVolume(symbol, volumeToClose);

@@ -416,6 +416,92 @@ func (b *MT5Bridge) CancelOrder(cancel OrderCancellation) {
 	b.SentToEA(session_id, client_order_id, message)
 }
 
+func (b *MT5Bridge) SendPartialClose(sessionID string, magic int64, positionID string, closePercent float64, filters map[string]string) {
+	b.sessionsMutex.RLock()
+	_, exists := b.sessionMagics[sessionID]
+	b.sessionsMutex.RUnlock()
+
+	if !exists {
+		log.Printf("[SendPartialClose] No session found: %s", sessionID)
+		return
+	}
+
+	// Check if kill switch is flattening (prevent partial close during full flatten)
+	b.killSwitchMutex.RLock()
+	state := b.killSwitchStates[sessionID]
+	b.killSwitchMutex.RUnlock()
+
+	if state == KILL_SWITCH_FLATTENING {
+		log.Printf("[SendPartialClose] Rejected - kill switch flattening active for session %s", sessionID)
+		return
+	}
+
+	message := fmt.Sprintf("PARTIAL_CLOSE|MAGIC=%d|CLOSE_PERCENT=%.2f", magic, closePercent)
+
+	if positionID != "" {
+		message += fmt.Sprintf("|POSITION_ID=%s", positionID)
+	}
+
+	if len(filters) > 0 {
+		for k, v := range filters {
+			message += fmt.Sprintf("|%s=%s", k, v)
+		}
+	}
+
+	message += "|\n"
+
+	b.SentToEA(sessionID, "", message)
+	log.Printf("[SendPartialClose] Sent partial close to session: %s (magic: %d, pct: %.2f)", sessionID, magic, closePercent)
+}
+
+func (b *MT5Bridge) SendClosePositions(sessionID string, magic int64, filters map[string]string) {
+	b.sessionsMutex.RLock()
+	_, exists := b.sessionMagics[sessionID]
+	b.sessionsMutex.RUnlock()
+
+	if !exists {
+		log.Printf("[SendClosePositions] No session found: %s", sessionID)
+		return
+	}
+
+	message := fmt.Sprintf("CLOSE_POSITIONS|MAGIC=%d", magic)
+
+	if len(filters) > 0 {
+		for k, v := range filters {
+			message += fmt.Sprintf("|%s=%s", k, v)
+		}
+	}
+
+	message += "|\n"
+
+	b.SentToEA(sessionID, "", message)
+	log.Printf("[SendClosePositions] Sent close positions to session: %s (magic: %d)", sessionID, magic)
+}
+
+func (b *MT5Bridge) SendDeleteOrders(sessionID string, magic int64, filters map[string]string) {
+	b.sessionsMutex.RLock()
+	_, exists := b.sessionMagics[sessionID]
+	b.sessionsMutex.RUnlock()
+
+	if !exists {
+		log.Printf("[SendDeleteOrders] No session found: %s", sessionID)
+		return
+	}
+
+	message := fmt.Sprintf("DELETE_ORDERS|MAGIC=%d", magic)
+
+	if len(filters) > 0 {
+		for k, v := range filters {
+			message += fmt.Sprintf("|%s=%s", k, v)
+		}
+	}
+
+	message += "|\n"
+
+	b.SentToEA(sessionID, "", message)
+	log.Printf("[SendDeleteOrders] Sent delete orders to session: %s (magic: %d)", sessionID, magic)
+}
+
 func (b *MT5Bridge) acceptConnections() {
 	defer b.wg.Done()
 
@@ -509,17 +595,18 @@ func (b *MT5Bridge) startWhileForListening(conn net.Conn, sessionID string) erro
 			b.processSymbolMetadata(sessionID, message)
 
 		case ACCOUNT:
-			log.Printf("[StartWhileForListening] Processing ACCOUNT from %s", sessionID)
+			// log.Printf("[StartWhileForListening] Processing ACCOUNT from %s", sessionID)
 			b.processAccountInfo(sessionID, message)
 
 		case PONG:
 			// Heartbeat - no action needed (reduced logging)
 
-		case KILL_SWITCH:
-			log.Printf("[StartWhileForListening] Received KILL_SWITCH from %s: %s", sessionID, message)
-
 		case KILL_SWITCH_ACK:
 			log.Printf("[StartWhileForListening] Received KILL_SWITCH_ACK from %s: %s", sessionID, message)
+
+		case ACK:
+			log.Printf("[StartWhileForListening] Processing ACK from %s: %s", sessionID, message)
+			b.processAckMessage(sessionID, message)
 
 		case HELLO:
 			log.Printf("  %s", sessionID)
@@ -620,6 +707,93 @@ func (b *MT5Bridge) processConfirmationMessage(message string) {
 	}
 }
 
+func (b *MT5Bridge) processAckMessage(sessionID string, message string) {
+	// Parse ACK message format: ACK|COMMAND_TYPE|COUNT=X|STATUS=Y|...
+	parts := strings.Split(message, "|")
+
+	var commandType string
+	var count int = 0
+	var status string
+
+	for _, part := range parts {
+		if part == "" || part == "ACK" {
+			continue
+		}
+		idx := strings.Index(part, "=")
+		if idx == -1 {
+			// If no =, this might be the command type
+			commandType = part
+			continue
+		}
+		key := part[:idx]
+		value := part[idx+1:]
+
+		switch key {
+		case "COUNT":
+			if c, err := strconv.Atoi(value); err == nil {
+				count = c
+			}
+		case "STATUS":
+			status = value
+		}
+	}
+
+	log.Printf("[processAckMessage] ACK received: command=%s, count=%d, status=%s", commandType, count, status)
+
+	// Create a confirmation for close operations to send back to benchmark
+	if commandType == "CLOSE_POSITIONS" || commandType == "PARTIAL_CLOSE" || commandType == "DELETE_ORDERS" {
+		confirmation := TradeConfirmation{
+			SessionID:     sessionID,
+			ClientOrderID: fmt.Sprintf("%s_%d", commandType, time.Now().Unix()), // Clean, readable ID like "CLOSE_POSITIONS_1234567890"
+			Status:        FILLED,                                               // Use FILLED to indicate success
+		}
+
+		if status == "OK" {
+			confirmation.Status = FILLED
+		} else {
+			confirmation.Status = REJECTED
+			confirmation.ReasonMessage = &status
+		}
+
+		// Create more descriptive reason message
+		var reasonMsg string
+		if count > 0 {
+			switch commandType {
+			case "CLOSE_POSITIONS":
+				reasonMsg = fmt.Sprintf("CLOSE_POSITIONS_SUCCESS: %d positions closed", count)
+			case "PARTIAL_CLOSE":
+				reasonMsg = fmt.Sprintf("PARTIAL_CLOSE_SUCCESS: %d positions partial closed", count)
+			case "DELETE_ORDERS":
+				reasonMsg = fmt.Sprintf("DELETE_ORDERS_SUCCESS: %d orders deleted", count)
+			}
+		} else {
+			switch commandType {
+			case "CLOSE_POSITIONS":
+				reasonMsg = "CLOSE_POSITIONS_SUCCESS: No positions found to close"
+			case "PARTIAL_CLOSE":
+				reasonMsg = "PARTIAL_CLOSE_SUCCESS: No positions found to partial close"
+			case "DELETE_ORDERS":
+				reasonMsg = "DELETE_ORDERS_SUCCESS: No orders found to delete"
+			}
+		}
+
+		if status != "OK" {
+			reasonMsg = fmt.Sprintf("%s (Status: %s)", reasonMsg, status)
+		}
+
+		confirmation.ReasonMessage = &reasonMsg
+
+		// Invoke callback to publish confirmation back to RabbitMQ
+		b.callbacksMutex.RLock()
+		callback := b.confirmationCallback
+		b.callbacksMutex.RUnlock()
+
+		if callback != nil {
+			callback(confirmation)
+		}
+	}
+}
+
 func (b *MT5Bridge) parseConfirmationStatus(status string) ConfirmationStatus {
 	switch status {
 	case "SENT":
@@ -665,11 +839,24 @@ func (b *MT5Bridge) parseHandshakeMessage(message string, conn net.Conn) (string
 		return "", fmt.Errorf("invalid handshake format")
 	}
 
-	sessionID := message[idx+len(prefix):]
-	sessionID = strings.TrimSpace(sessionID)
+	// Extract session_id and optional magic
+	remaining := message[idx+len(prefix):]
+	parts := strings.Split(remaining, ";")
+	sessionID := strings.TrimSpace(parts[0])
 
 	if sessionID == "" {
 		return "", fmt.Errorf("empty session_id")
+	}
+
+	var magic int64
+	var hasMagic bool
+	if len(parts) > 1 && strings.HasPrefix(parts[1], "magic=") {
+		magicStr := strings.TrimPrefix(parts[1], "magic=")
+		magicStr = strings.TrimSpace(magicStr)
+		if parsedMagic, err := strconv.ParseInt(magicStr, 10, 64); err == nil {
+			magic = parsedMagic
+			hasMagic = true
+		}
 	}
 
 	b.sessionsMutex.Lock()
@@ -677,12 +864,31 @@ func (b *MT5Bridge) parseHandshakeMessage(message string, conn net.Conn) (string
 		b.sessionsMutex.Unlock()
 		return "", fmt.Errorf("session already exists: %s", sessionID)
 	}
-	magic := b.magicCounter.Add(1) + 10000
-	b.sessionMagics[sessionID] = magic
+
+	if hasMagic {
+		// Use the provided magic
+		b.sessionMagics[sessionID] = magic
+		log.Printf("[ProcessHandshake] Using provided magic %d for session: %s", magic, sessionID)
+	} else {
+		// Assign new magic
+		magic = b.magicCounter.Add(1) + 10000
+		b.sessionMagics[sessionID] = magic
+		log.Printf("[ProcessHandshake] Assigned new magic %d to session: %s", magic, sessionID)
+	}
+
 	b.connectedEAs[sessionID] = conn
 	b.sessionsMutex.Unlock()
 
-	log.Printf("[ProcessHandshake] Assigned magic %d to session: %s", magic, sessionID)
+	// Send magic to EA only if we assigned a new one
+	if !hasMagic {
+		magicMsg := fmt.Sprintf("MAGIC|magic=%d|\n", magic)
+		_, err := conn.Write([]byte(magicMsg))
+		if err != nil {
+			log.Printf("[ProcessHandshake] Failed to send magic to session %s: %v", sessionID, err)
+			return "", fmt.Errorf("failed to send magic: %w", err)
+		}
+		log.Printf("[ProcessHandshake] Sent magic %d to session: %s", magic, sessionID)
+	}
 
 	return sessionID, nil
 }
@@ -702,10 +908,10 @@ func (b *MT5Bridge) parseMessageType(message string) MessageType {
 		return SYMBOLS
 	} else if strings.Contains(message, "ACCOUNT") {
 		return ACCOUNT
-	} else if strings.Contains(message, "KILL_SWITCH") {
-		return KILL_SWITCH
 	} else if strings.Contains(message, "KILL_SWITCH_ACK") {
 		return KILL_SWITCH_ACK
+	} else if strings.Contains(message, "ACK|") {
+		return ACK
 	}
 	return UNKNOWN
 }
@@ -926,7 +1132,7 @@ func (b *MT5Bridge) processAccountInfo(sessionID, message string) {
 	b.accountMetadata[sessionID] = accountInfo
 	b.symbolsMutex.Unlock()
 
-	log.Printf("[processAccountInfo] Stored account info from EA %s: Balance=%.2f, Equity=%.2f, Profit=%.2f, Margin=%.2f, MarginFree=%.2f", sessionID, accountInfo.Balance, accountInfo.Equity, accountInfo.Profit, accountInfo.Margin, accountInfo.MarginFree)
+	// log.Printf("[processAccountInfo] Stored account info from EA %s: Balance=%.2f, Equity=%.2f, Profit=%.2f, Margin=%.2f, MarginFree=%.2f", sessionID, accountInfo.Balance, accountInfo.Equity, accountInfo.Profit, accountInfo.Margin, accountInfo.MarginFree)
 }
 
 // ResolveSymbol maps canonical symbols to broker-specific symbols

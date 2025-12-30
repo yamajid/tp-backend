@@ -15,8 +15,40 @@ Usage:
     # Test CANCEL operation (cancels second filled order)
     python ea_benchmark.py --session ea_00 --orders 3 --test-cancel
     
-    # Test both MODIFY and CANCEL
-    python ea_benchmark.py --session ea_00 --orders 5 --test-modify --test-cancel
+    # Test CLOSE operations (independent of order sending)
+    python ea_benchmark.py --session ea_00 --test-close-positions
+    python ea_benchmark.py --session ea_00 --test-partial-close --partial-close-percent 25.0
+    python ea_benchmark.py --session ea_00 --test-close-positions --close-filters "PNL=PROFIT,SIDE=BUY"
+    
+
+
+
+    MARKET_BUY
+        python3 ea_benchmark.py --session ea_00 --orders 1 --symbol GBPUSD --volume 1.0 --order-type MARKET_BUY --magic 10001
+    MARKET SELL
+        python3 ea_benchmark.py --session ea_00 --orders 1 --symbol GBPUSD --volume 1.0 --order-type MARKET_SELL --magic 10001 
+    LIMIT BUY
+        python3 ea_benchmark.py --session ea_00 --orders 1 --symbol GBPUSD --volume 1.0 --order-type LIMIT_BUY --price 1.2500 --magic 10001
+    LIMIT SELL
+        python3 ea_benchmark.py --session ea_00 --orders 1 --symbol GBPUSD --volume 1.0 --order-type LIMIT_SELL --price 1.2600 --magic 10001   
+    STOP BUY 
+        python3 ea_benchmark.py --session ea_00 --orders 1 --symbol GBPUSD --volume 1.0 --order-type STOP_BUY --price 1.2550 --magic 10001  
+    STOP SELL
+        python3 ea_benchmark.py --session ea_00 --orders 1 --symbol GBPUSD --volume 1.0 --order-type STOP_SELL --price 1.2450 --magic 10001
+    PARTIAL CLOSE ALL POPSITIONS
+        python3 ea_benchmark.py --session ea_00 --test-partial-close --partial-close-percent 50.0 --magic 10001 
+    PARTIAL CLOSE SPECIFIC POSTION
+        python3 ea_benchmark.py --session ea_00 --test-partial-close --partial-close-percent 25.0 --close-position-id 135948160 --magic 10001
+    CLOSE ALL POSITION
+        python3 ea_benchmark.py --session ea_00 --test-close-positions --magic 10001
+    CLOSE POSITIONS WITH FILTER
+        python3 ea_benchmark.py --session ea_00 --test-close-positions --symbol GBPUSD --pnl PROFIT --side BUY --magic 10001
+    DELETE PENDING ORDERS
+        python3 ea_benchmark.py --session ea_00 --test-delete-orders --magic 10001
+    DELETE PENDING ORDERS WITH FILTERS
+        python3 ea_benchmark.py --session ea_00 --test-delete-orders --symbol EURUSD --order-type LIMIT --magic 10001
+    DEFINE SYMBOL, SCOPE, PNL, SIDE
+        python3 ea_benchmark.py --session ea_00 --test-partial-close --partial-close-percent 50.0 --close-filters "PNL=PROFIT,SYMBOL=EURUSD,SIDE=BUY" --magic 10001
 """
 
 
@@ -63,12 +95,13 @@ class OrderResult:
 
 class RabbitMQBenchmark:
     def __init__(self, host: str, port: int, session_id: str, 
-                 order_exchange: str, confirmation_queue: str):
+                 order_exchange: str, confirmation_queue: str, magic: int = 12345):
         self.host = host
         self.port = port
         self.session_id = "ea_00"
         self.order_exchange = order_exchange
         self.confirmation_queue = confirmation_queue
+        self.magic = magic
         
         # RabbitMQ connections (separate for thread safety)
         self.publish_connection = None
@@ -80,6 +113,18 @@ class RabbitMQBenchmark:
         self.lock = threading.Lock()
         self.running = False
         self.all_orders_published = False  # NEW: Flag to indicate when all orders are sent
+    
+    def parse_filters(self, filters_str: str) -> dict:
+        """Parse filter string like 'PNL=PROFIT,SIDE=BUY' into dict"""
+        if not filters_str:
+            return {}
+        
+        filters = {}
+        for pair in filters_str.split(','):
+            if '=' in pair:
+                key, value = pair.split('=', 1)
+                filters[key.strip()] = value.strip()
+        return filters
         
     def connect(self):
         """Connect to RabbitMQ with separate connections for publishing and consuming"""
@@ -148,7 +193,7 @@ class RabbitMQBenchmark:
             "sl": sl,
             "tp": tp,
             "price": price if price is not None else 1.10,
-            "magic_number": 12345
+            "magic_number": self.magic
         }
         
         result = OrderResult(order_id=order_id, sent_at=time.time())
@@ -242,6 +287,92 @@ class RabbitMQBenchmark:
             print(f"✗ Cancel publish failed: {e}")
             return False
     
+    def publish_close_positions(self, filters: dict = None):
+        """Publish close positions command to RabbitMQ"""
+        close_message = {
+            "type": "CLOSE_POSITIONS",
+            "session_id": self.session_id,
+            "magic_number": self.magic
+        }
+        
+        if filters:
+            close_message["filters"] = filters
+        
+        try:
+            self.publish_channel.basic_publish(
+                exchange=self.order_exchange,
+                routing_key='orders.close',
+                body=json.dumps(close_message),
+                properties=pika.BasicProperties(
+                    delivery_mode=2,
+                    content_type='application/json'
+                )
+            )
+            print(f"→ Published CLOSE_POSITIONS with filters: {filters}")
+            return True
+        except Exception as e:
+            print(f"✗ Close positions publish failed: {e}")
+            return False
+    
+    def publish_partial_close(self, close_percent: float = 50.0, position_id: str = None, filters: dict = None):
+        """Publish partial close command to RabbitMQ"""
+        partial_close_message = {
+            "type": "PARTIAL_CLOSE",
+            "session_id": self.session_id,
+            "magic_number": self.magic,
+            "close_percent": close_percent
+        }
+        
+        if position_id:
+            partial_close_message["position_id"] = position_id
+        
+        if filters:
+            partial_close_message["filters"] = filters
+        
+        try:
+            self.publish_channel.basic_publish(
+                exchange=self.order_exchange,
+                routing_key='orders.close',
+                body=json.dumps(partial_close_message),
+                properties=pika.BasicProperties(
+                    delivery_mode=2,
+                    content_type='application/json'
+                )
+            )
+            filter_desc = f"position {position_id}" if position_id else f"filters: {filters}"
+            print(f"→ Published PARTIAL_CLOSE ({close_percent}%) for {filter_desc}")
+            return True
+        except Exception as e:
+            print(f"✗ Partial close publish failed: {e}")
+            return False
+    
+    def publish_delete_orders(self, filters: dict = None):
+        """Publish delete orders command to RabbitMQ"""
+        delete_message = {
+            "type": "DELETE_ORDERS",
+            "session_id": self.session_id,
+            "magic_number": self.magic
+        }
+        
+        if filters:
+            delete_message["filters"] = filters
+        
+        try:
+            self.publish_channel.basic_publish(
+                exchange=self.order_exchange,
+                routing_key='orders.close',
+                body=json.dumps(delete_message),
+                properties=pika.BasicProperties(
+                    delivery_mode=2,
+                    content_type='application/json'
+                )
+            )
+            print(f"→ Published DELETE_ORDERS with filters: {filters}")
+            return True
+        except Exception as e:
+            print(f"✗ Delete orders publish failed: {e}")
+            return False
+    
     def consume_confirmations(self, timeout: float = 30.0):
         """Consume confirmations from RabbitMQ confirmation queue"""
         self.running = True
@@ -249,11 +380,19 @@ class RabbitMQBenchmark:
         
         def callback(ch, method, properties, body):
             try:
-                message = json.loads(body.decode())
-                self.process_confirmation(message)
+                message_str = body.decode()
+                
+                # Try to parse as JSON first (for order confirmations)
+                try:
+                    message = json.loads(message_str)
+                    self.process_confirmation(message)
+                except json.JSONDecodeError:
+                    # Handle plain text ACK messages from EA
+                    self.process_plain_ack(message_str)
+                
                 ch.basic_ack(delivery_tag=method.delivery_tag)
             except Exception as e:
-                print(f"✗ Error processing confirmation: {e}")
+                print(f"✗ Error processing message: {e}")
                 ch.basic_ack(delivery_tag=method.delivery_tag)
         
         # Start consuming
@@ -287,6 +426,17 @@ class RabbitMQBenchmark:
         print(f"← Received confirmation: {json.dumps(message)}")
         
         order_id = message.get('client_order_id', '')
+        
+        # Check if this is a close operation confirmation (starts with CLOSE_)
+        if order_id.startswith('CLOSE_'):
+            self.process_close_confirmation(message)
+            return
+        
+        # Handle close ACK messages (EA sends them as plain text, but they might be parsed as dict)
+        if isinstance(message.get('type'), str) and message['type'].startswith('ACK|'):
+            self.process_close_ack(message)
+            return
+        
         status = message.get('status', '')
         ticket = message.get('ticket_id', '')
         reason = message.get('reason', '')
@@ -303,6 +453,53 @@ class RabbitMQBenchmark:
                     latency = result.latency_ms
                     print(f"✓ Order {order_id}: {status} (latency: {latency:.2f}ms)")
                     break
+    
+    def process_close_confirmation(self, message: dict):
+        """Process close operation confirmation"""
+        # Handle both old format (for compatibility) and new CamelCase format
+        order_id = message.get('operationId') or message.get('client_order_id', '')
+        status = message.get('status', 'UNKNOWN')
+        reason = message.get('message') or message.get('reason', '')
+        
+        # Check if this is a close operation (format: COMMAND_TYPE_timestamp)
+        if order_id.startswith(('CLOSE_POSITIONS_', 'PARTIAL_CLOSE_', 'DELETE_ORDERS_')):
+            command_type = order_id.split('_')[0] + '_' + order_id.split('_')[1]  # Extract "CLOSE_POSITIONS", "PARTIAL_CLOSE", etc.
+            if status == 'FILLED':
+                print(f"✅ {command_type.replace('_', ' ')} SUCCESS: {reason}")
+            else:
+                print(f"❌ {command_type.replace('_', ' ')} FAILED: {reason}")
+            return
+        
+        # Fallback for other formats
+        print(f"✓ Close operation completed: {status}")
+        if reason:
+            print(f"  Details: {reason}")
+    
+    def process_plain_ack(self, message_str: str):
+        """Process plain text ACK messages from EA"""
+        print(f"← Received plain ACK: {message_str.strip()}")
+        
+        # Parse ACK format: "ACK|CLOSE_POSITIONS|COUNT=5|STATUS=OK|"
+        parts = message_str.split('|')
+        if len(parts) >= 4 and parts[0] == 'ACK':
+            ack_type = parts[1]
+            count = 0
+            status = 'UNKNOWN'
+            
+            for part in parts[2:]:
+                if part.startswith('COUNT='):
+                    count = int(part.split('=')[1])
+                elif part.startswith('STATUS='):
+                    status = part.split('=')[1]
+            
+            if 'CLOSE_POSITIONS' in ack_type:
+                print(f"✓ CLOSE_POSITIONS ACK: {count} positions closed (Status: {status})")
+            elif 'PARTIAL_CLOSE' in ack_type:
+                print(f"✓ PARTIAL_CLOSE ACK: {count} positions partial closed (Status: {status})")
+            elif 'DELETE_ORDERS' in ack_type:
+                print(f"✓ DELETE_ORDERS ACK: {count} orders deleted (Status: {status})")
+            else:
+                print(f"✓ Close ACK received: {ack_type} - Count: {count}, Status: {status}")
     
     def disconnect(self):
         """Close RabbitMQ connections"""
@@ -385,6 +582,7 @@ def main():
     parser.add_argument('--price', type=float, help='Order price for LIMIT/STOP orders')
     parser.add_argument('--sl', type=float, default=0.0, help='Stop loss price')
     parser.add_argument('--tp', type=float, default=0.0, help='Take profit price')
+    parser.add_argument('--magic', type=int, default=12345, help='Magic number for orders (default: 12345)')
     parser.add_argument('--order-exchange', default='e.trades.orders', help='Order exchange name')
     parser.add_argument('--confirmation-queue', default='q.mt5.order_confirmations', help='Confirmation queue name')
     parser.add_argument('--timeout', type=float, default=30.0, help='Confirmation timeout (seconds)')
@@ -394,6 +592,12 @@ def main():
     parser.add_argument('--modify-sl', type=float, help='New stop loss for modify')
     parser.add_argument('--modify-tp', type=float, help='New take profit for modify')
     parser.add_argument('--cancel-order-id', type=str, help='Client order ID to cancel (e.g., BENCH_abc123)')
+    parser.add_argument('--test-close-positions', action='store_true', help='Test close positions command')
+    parser.add_argument('--test-partial-close', action='store_true', help='Test partial close command')
+    parser.add_argument('--test-delete-orders', action='store_true', help='Test delete orders command')
+    parser.add_argument('--close-filters', type=str, help='Filters for close operations (e.g., "PNL=PROFIT,SIDE=BUY")')
+    parser.add_argument('--partial-close-percent', type=float, default=50.0, help='Percentage to close for partial close (default: 50.0)')
+    parser.add_argument('--close-position-id', type=str, help='Specific position ID to close (for partial close)')
     
     args = parser.parse_args()
     
@@ -410,6 +614,12 @@ def main():
     print(f"  Delay:               {args.delay}s")
     print(f"  Order Exchange:      {args.order_exchange}")
     print(f"  Confirmation Queue:  {args.confirmation_queue}")
+    if args.test_close_positions or args.test_partial_close or args.test_delete_orders:
+        print(f"  Close Tests:         {args.test_close_positions and 'CLOSE_POSITIONS' or ''} {args.test_partial_close and 'PARTIAL_CLOSE' or ''} {args.test_delete_orders and 'DELETE_ORDERS' or ''}".strip())
+        if args.close_filters:
+            print(f"  Close Filters:       {args.close_filters}")
+        if args.test_partial_close:
+            print(f"  Partial Close %:     {args.partial_close_percent}%")
     print("="*80 + "\n")
     
     benchmark = RabbitMQBenchmark(
@@ -417,7 +627,8 @@ def main():
         args.port, 
         args.session,
         args.order_exchange,
-        args.confirmation_queue
+        args.confirmation_queue,
+        args.magic
     )
     
     # Connect
@@ -478,71 +689,106 @@ def main():
         benchmark.print_statistics()
         return 0
     
-    # Send orders
-    print(f"\nSending {args.orders} orders...")
-    filled_orders = {}  # Map: order_id -> ticket_id (will be populated after confirmations)
-    
-    for i in range(args.orders):
-        benchmark.publish_order(
-            symbol=args.symbol,
-            order_type=args.order_type,
-            volume=args.volume,
-            price=args.price,
-            sl=args.sl,
-            tp=args.tp
-        )
-        if i < args.orders - 1:
-            time.sleep(args.delay)
-    
-    # Wait a bit for initial confirmations
-    if args.test_modify or args.test_cancel:
-        print("\nWaiting for initial confirmations before testing modify/cancel...")
+    # Send orders (only if close tests are not specified)
+    if not (args.test_close_positions or args.test_partial_close or args.test_delete_orders):
+        print(f"\nSending {args.orders} orders...")
+        filled_orders = {}  # Map: order_id -> ticket_id (will be populated after confirmations)
         
-        # Wait up to 10 seconds for ALL confirmations
-        max_wait = 10
-        expected_confirmations = args.orders
-        for i in range(max_wait):
-            time.sleep(1)
+        for i in range(args.orders):
+            benchmark.publish_order(
+                symbol=args.symbol,
+                order_type=args.order_type,
+                volume=args.volume,
+                price=args.price,
+                sl=args.sl,
+                tp=args.tp
+            )
+            if i < args.orders - 1:
+                time.sleep(args.delay)
+        
+        # Wait a bit for initial confirmations
+        if args.test_modify or args.test_cancel:
+            print("\nWaiting for initial confirmations before testing modify/cancel...")
+            
+            # Wait up to 10 seconds for ALL confirmations
+            max_wait = 10
+            expected_confirmations = args.orders
+            for i in range(max_wait):
+                time.sleep(1)
+                with benchmark.lock:
+                    filled_count = sum(1 for r in benchmark.results if r.status == "FILLED")
+                    if filled_count >= expected_confirmations:
+                        print(f"✓ Received all {filled_count} confirmations")
+                        break
+                    elif filled_count > 0:
+                        print(f"  Waiting... ({filled_count}/{expected_confirmations} confirmations received)")
+            
+            # Collect filled orders (need client_order_id AND ticket_id)
+            filled_orders = {}  # Map: order_id -> ticket_id
             with benchmark.lock:
-                filled_count = sum(1 for r in benchmark.results if r.status == "FILLED")
-                if filled_count >= expected_confirmations:
-                    print(f"✓ Received all {filled_count} confirmations")
-                    break
-                elif filled_count > 0:
-                    print(f"  Waiting... ({filled_count}/{expected_confirmations} confirmations received)")
-        
-        # Collect filled orders (need client_order_id AND ticket_id)
-        filled_orders = {}  # Map: order_id -> ticket_id
-        with benchmark.lock:
-            for result in benchmark.results:
-                if result.status == "FILLED" and result.ticket:
-                    filled_orders[result.order_id] = result.ticket
-        
-        if filled_orders:
-            print(f"\nFound {len(filled_orders)} filled orders for testing")
+                for result in benchmark.results:
+                    if result.status == "FILLED" and result.ticket:
+                        filled_orders[result.order_id] = result.ticket
             
-            # Test MODIFY
-            if args.test_modify and len(filled_orders) > 0:
-                order_id = list(filled_orders.keys())[0]
-                print(f"\nTesting MODIFY_ORDER on {order_id} (ticket: {filled_orders[order_id]})...")
-                benchmark.publish_modify_order(
-                    client_order_id=order_id,
-                    new_sl=1.14000,  # Below current price for BUY
-                    new_tp=1.17000   # Above current price for BUY
-                )
-                time.sleep(1)
-            
-            # Test CANCEL
-            if args.test_cancel and len(filled_orders) > 1:
-                order_id = list(filled_orders.keys())[1]
-                print(f"\nTesting CANCEL_ORDER on {order_id} (ticket: {filled_orders[order_id]})...")
-                benchmark.publish_cancel_order(
-                    client_order_id=order_id,
-                    symbol=args.symbol
-                )
-                time.sleep(1)
-        else:
-            print("\n⚠ No filled orders available for modify/cancel tests")
+            if filled_orders:
+                print(f"\nFound {len(filled_orders)} filled orders for testing")
+                
+                # Test MODIFY
+                if args.test_modify and len(filled_orders) > 0:
+                    order_id = list(filled_orders.keys())[0]
+                    print(f"\nTesting MODIFY_ORDER on {order_id} (ticket: {filled_orders[order_id]})...")
+                    benchmark.publish_modify_order(
+                        client_order_id=order_id,
+                        new_sl=1.14000,  # Below current price for BUY
+                        new_tp=1.17000   # Above current price for BUY
+                    )
+                    time.sleep(1)
+                
+                # Test CANCEL
+                if args.test_cancel and len(filled_orders) > 1:
+                    order_id = list(filled_orders.keys())[1]
+                    print(f"\nTesting CANCEL_ORDER on {order_id} (ticket: {filled_orders[order_id]})...")
+                    benchmark.publish_cancel_order(
+                        client_order_id=order_id,
+                        symbol=args.symbol
+                    )
+                    time.sleep(1)
+            else:
+                print("\n⚠ No filled orders available for modify/cancel tests")
+    
+    # Test CLOSE commands (if specified)
+    if args.test_close_positions or args.test_partial_close or args.test_delete_orders:
+        print("\n" + "="*60)
+        print("Testing CLOSE Commands")
+        print("="*60)
+        
+        # Parse filters if provided
+        filters = benchmark.parse_filters(args.close_filters) if args.close_filters else None
+        
+        # Test CLOSE_POSITIONS
+        if args.test_close_positions:
+            print(f"\nTesting CLOSE_POSITIONS with filters: {filters}")
+            benchmark.publish_close_positions(filters=filters)
+            time.sleep(2)
+        
+        # Test PARTIAL_CLOSE
+        if args.test_partial_close:
+            print(f"\nTesting PARTIAL_CLOSE ({args.partial_close_percent}%) with filters: {filters}")
+            benchmark.publish_partial_close(
+                close_percent=args.partial_close_percent,
+                position_id=args.close_position_id,
+                filters=filters
+            )
+            time.sleep(2)
+        
+        # Test DELETE_ORDERS
+        if args.test_delete_orders:
+            print(f"\nTesting DELETE_ORDERS with filters: {filters}")
+            benchmark.publish_delete_orders(filters=filters)
+            time.sleep(2)
+        
+        print("\nNote: Close commands now generate confirmations showing operation results.")
+        print("Check the confirmation messages above for close operation status.")
     
     # Signal that all orders have been published
     with benchmark.lock:
