@@ -35,6 +35,10 @@ int pingTimeout = 30; // Timeout for PING reception in seconds
 // State persistence
 string stateFile = "ea_state.txt";
 
+// Kill switch state
+bool killSwitchActive = false;
+string killSwitchState = "NORMAL"; // NORMAL, HALTED, FLATTENING
+
 //+------------------------------------------------------------------+
 //| Helper: Ensure symbol is selected and subscribed                 |
 //+------------------------------------------------------------------+
@@ -398,6 +402,9 @@ void ProcessCommand(string command) {
    else if(StringFind(command, "PARTIAL_CLOSE|") == 0) {
       ProcessPartialClose(command);
    }
+   else if(StringFind(command, "KILL_SWITCH|") == 0) {
+      ProcessKillSwitch(command);
+   }
    else if(StringFind(command, "PING") == 0) {
       // Respond to heartbeat and update last ping time
       lastPingReceived = TimeCurrent();
@@ -539,6 +546,9 @@ void SaveState() {
    }
    FileWrite(file, ordData);
    
+   // Save kill switch state
+   FileWrite(file, "KILL_SWITCH|STATE=" + killSwitchState + "|ACTIVE=" + (killSwitchActive ? "1" : "0"));
+   
    FileClose(file);
    Print("State saved to ", stateFile);
 }
@@ -575,6 +585,11 @@ void LoadState() {
          // Parse orders
          Print("Loaded orders data: ", line);
       }
+      else if(StringFind(line, "KILL_SWITCH|") == 0) {
+         killSwitchState = GetField(line, "STATE");
+         killSwitchActive = (GetField(line, "ACTIVE") == "1");
+         Print("Loaded kill switch state: ", killSwitchState, " Active: ", killSwitchActive);
+      }
    }
    
    FileClose(file);
@@ -605,6 +620,12 @@ void ProcessSendOrder(string message) {
    // Ensure symbol is subscribed before trading
    if(!EnsureSymbol(symbol)) {
       SendConfirmation(clientOrderId, "REJECTED", 0, 0.0, "Symbol not available: " + symbol);
+      return;
+   }
+   
+   // Check kill switch
+   if(killSwitchActive) {
+      SendConfirmation(clientOrderId, "REJECTED", 0, 0.0, "Kill switch active - order rejected");
       return;
    }
    
@@ -705,6 +726,12 @@ void ProcessModifyOrder(string message) {
       return;
    }
    
+   // Check kill switch
+   if(killSwitchActive) {
+      SendConfirmation(clientOrderId, "REJECTED", 0, 0.0, "Kill switch active - modify rejected");
+      return;
+   }
+   
    // Debug: List all open positions
    Print("Total positions: ", PositionsTotal());
    for(int i = 0; i < PositionsTotal(); i++) {
@@ -785,6 +812,12 @@ void ProcessCancelOrder(string message) {
    
    if(ticket == 0) {
       SendConfirmation(clientOrderId, "REJECTED", 0, 0.0, "Invalid ticket ID");
+      return;
+   }
+   
+   // Check kill switch
+   if(killSwitchActive) {
+      SendConfirmation(clientOrderId, "REJECTED", 0, 0.0, "Kill switch active - cancel rejected");
       return;
    }
    
@@ -992,4 +1025,66 @@ void ProcessPartialClose(string message) {
    string ack = "ACK|PARTIAL_CLOSE|COUNT=" + IntegerToString(partialClosedCount) + "|STATUS=OK|\n";
    SendToHub(ack);
    Print("Sent partial close acknowledgment: ", partialClosedCount, " positions partial closed");
+}
+
+//+------------------------------------------------------------------+
+//| Process kill switch command                                      |
+//+------------------------------------------------------------------+
+void ProcessKillSwitch(string message) {
+   string action = GetField(message, "ACTION");
+   
+   if(action == "HALT") {
+      killSwitchActive = true;
+      killSwitchState = "HALTED";
+      Print("Kill switch activated: HALT - rejecting new orders");
+   }
+   else if(action == "FLATTEN") {
+      killSwitchActive = true;
+      killSwitchState = "FLATTENING";
+      Print("Kill switch activated: FLATTEN - closing all positions");
+      long magic = StringToInteger(GetField(message, "MAGIC"));
+      CloseAllPositions(magic);
+   }
+   else if(action == "RESUME") {
+      killSwitchActive = false;
+      killSwitchState = "NORMAL";
+      Print("Kill switch deactivated: RESUME - normal trading resumed");
+   }
+   else {
+      Print("WARNING: Unknown kill switch action: ", action);
+   }
+   
+   // Send acknowledgment
+   string ack = "KILL_SWITCH_ACK|STATE=" + killSwitchState + "|STATUS=OK|\n";
+   SendToHub(ack);
+}
+
+//+------------------------------------------------------------------+
+//| Close all positions with specified magic number                  |
+//+------------------------------------------------------------------+
+void CloseAllPositions(long targetMagic) {
+   int total = PositionsTotal();
+   int closedCount = 0;
+   
+   for(int i = total - 1; i >= 0; i--) {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0) {
+         long posMagic = PositionGetInteger(POSITION_MAGIC);
+         
+         // Only close positions with matching magic
+         if(posMagic == targetMagic) {
+            string symbol = PositionGetString(POSITION_SYMBOL);
+            ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+            
+            if(trade.PositionClose(ticket)) {
+               closedCount++;
+               Print("✓ Closed position: ", ticket, " Symbol: ", symbol, " Type: ", EnumToString(type));
+            } else {
+               Print("✗ Failed to close position: ", ticket, " Error: ", GetLastError());
+            }
+         }
+      }
+   }
+   
+   Print("Closed ", closedCount, " positions with magic: ", targetMagic);
 }

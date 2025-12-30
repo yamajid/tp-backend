@@ -9,7 +9,29 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
+
+type KillSwitchState int
+
+const (
+	KILL_SWITCH_NORMAL KillSwitchState = iota
+	KILL_SWITCH_HALTED
+	KILL_SWITCH_FLATTENING
+)
+
+func (ks KillSwitchState) String() string {
+	switch ks {
+	case KILL_SWITCH_NORMAL:
+		return "NORMAL"
+	case KILL_SWITCH_HALTED:
+		return "HALTED"
+	case KILL_SWITCH_FLATTENING:
+		return "FLATTENING"
+	default:
+		return "UNKNOWN"
+	}
+}
 
 type MT5Bridge struct {
 	config   PlatformConfig
@@ -34,16 +56,20 @@ type MT5Bridge struct {
 	shutdown     chan struct{}
 	wg           sync.WaitGroup
 	magicCounter atomic.Int64
+
+	killSwitchStates map[string]KillSwitchState
+	killSwitchMutex  sync.RWMutex
 }
 
 func NewMT5Bridge() *MT5Bridge {
 	return &MT5Bridge{
-		connectedEAs:    make(map[string]net.Conn),
-		trackingOrders:  make(map[string]TrackingOrderInfo),
-		symbolMetadata:  make(map[string]SymbolInfo),
-		accountMetadata: make(map[string]AccountInfo),
-		sessionMagics:   make(map[string]int64),
-		shutdown:        make(chan struct{}),
+		connectedEAs:     make(map[string]net.Conn),
+		trackingOrders:   make(map[string]TrackingOrderInfo),
+		symbolMetadata:   make(map[string]SymbolInfo),
+		accountMetadata:  make(map[string]AccountInfo),
+		sessionMagics:    make(map[string]int64),
+		shutdown:         make(chan struct{}),
+		killSwitchStates: make(map[string]KillSwitchState),
 	}
 }
 
@@ -98,6 +124,10 @@ func (b *MT5Bridge) Connect() {
 
 	b.wg.Add(1)
 	go b.acceptConnections()
+
+	// Start heartbeat goroutine
+	b.wg.Add(1)
+	go b.heartbeat()
 }
 
 func (b *MT5Bridge) Disconnect() {
@@ -125,6 +155,36 @@ func (b *MT5Bridge) Disconnect() {
 	b.wg.Wait()
 }
 
+func (b *MT5Bridge) heartbeat() {
+	defer b.wg.Done()
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-b.shutdown:
+			return
+		case <-ticker.C:
+			b.sendHeartbeat()
+		}
+	}
+}
+
+func (b *MT5Bridge) sendHeartbeat() {
+	b.sessionsMutex.RLock()
+	sessions := make([]string, 0, len(b.connectedEAs))
+	for sessionID := range b.connectedEAs {
+		sessions = append(sessions, sessionID)
+	}
+	b.sessionsMutex.RUnlock()
+
+	for _, sessionID := range sessions {
+		pingMsg := "PING\n"
+		b.SentToEA(sessionID, "", pingMsg)
+		log.Printf("[Heartbeat] Sent PING to session: %s", sessionID)
+	}
+}
+
 func (b *MT5Bridge) SentToEA(session_id string, client_order_id string, message string) {
 	var conn net.Conn
 
@@ -146,6 +206,71 @@ func (b *MT5Bridge) SentToEA(session_id string, client_order_id string, message 
 	if err != nil {
 		log.Printf("Error sending message to EA: %v", err)
 	}
+}
+
+func (b *MT5Bridge) Halt(sessionID string) {
+	b.killSwitchMutex.Lock()
+	b.killSwitchStates[sessionID] = KILL_SWITCH_HALTED
+	b.killSwitchMutex.Unlock()
+	log.Printf("[KillSwitch] Session %s halted - rejecting new orders", sessionID)
+}
+
+func (b *MT5Bridge) FlattenAll(sessionID string) {
+	b.killSwitchMutex.Lock()
+	b.killSwitchStates[sessionID] = KILL_SWITCH_FLATTENING
+	b.killSwitchMutex.Unlock()
+	log.Printf("[KillSwitch] Session %s flattening all positions", sessionID)
+	// Send FLATTEN command to the specific EA
+	b.sendKillSwitchToEA(sessionID, "FLATTEN")
+}
+
+func (b *MT5Bridge) Resume(sessionID string) {
+	b.killSwitchMutex.Lock()
+	b.killSwitchStates[sessionID] = KILL_SWITCH_NORMAL
+	b.killSwitchMutex.Unlock()
+	log.Printf("[KillSwitch] Session %s resumed - accepting orders", sessionID)
+	// Send RESUME command to the specific EA
+	b.sendKillSwitchToEA(sessionID, "RESUME")
+}
+
+func (b *MT5Bridge) sendKillSwitchToEA(sessionID, action string) {
+	b.sessionsMutex.RLock()
+	magic, exists := b.sessionMagics[sessionID]
+	b.sessionsMutex.RUnlock()
+
+	magicStr := ""
+	if exists {
+		magicStr = fmt.Sprintf("|MAGIC=%d", magic)
+	}
+
+	msg := fmt.Sprintf("KILL_SWITCH|ACTION=%s|TIMESTAMP=%d%s|\n", action, time.Now().Unix(), magicStr)
+	b.SentToEA(sessionID, "", msg)
+	log.Printf("[KillSwitch] Sent %s to session: %s (magic: %d)", action, sessionID, magic)
+}
+
+func (b *MT5Bridge) IsKillSwitchActive(sessionID string) bool {
+	b.killSwitchMutex.RLock()
+	state, exists := b.killSwitchStates[sessionID]
+	b.killSwitchMutex.RUnlock()
+	return exists && state != KILL_SWITCH_NORMAL
+}
+
+func (b *MT5Bridge) resendKillSwitchState(sessionID string) {
+	b.killSwitchMutex.RLock()
+	state, exists := b.killSwitchStates[sessionID]
+	b.killSwitchMutex.RUnlock()
+
+	if !exists || state == KILL_SWITCH_NORMAL {
+		return
+	}
+
+	switch state {
+	case KILL_SWITCH_HALTED:
+		b.sendKillSwitchToEA(sessionID, "HALT")
+	case KILL_SWITCH_FLATTENING:
+		b.sendKillSwitchToEA(sessionID, "FLATTEN")
+	}
+	log.Printf("[KillSwitch] Resent %s state to reconnected session: %s", state.String(), sessionID)
 }
 
 func (b *MT5Bridge) SendOrder(order Order) {
@@ -185,6 +310,11 @@ func (b *MT5Bridge) SendOrder(order Order) {
 		b.ordersMutex.Unlock()
 		return
 	}
+	if b.IsKillSwitchActive(session_id) {
+		b.ordersMutex.Unlock()
+		log.Printf("[SendOrder] Rejected - kill switch active for session %s, ClientOrderID: %s", session_id, order.ClientOrderID)
+		return
+	}
 	session_id = order.SessionID
 	client_order_iD = order.ClientOrderID
 	b.trackingOrders[order.ClientOrderID] = TrackingOrderInfo{
@@ -209,6 +339,11 @@ func (b *MT5Bridge) ModifyOrder(mod OrderModification) {
 		b.ordersMutex.Lock()
 		if !b.isRunning.Load() {
 			b.ordersMutex.Unlock()
+			return
+		}
+		if b.IsKillSwitchActive(session_id) {
+			b.ordersMutex.Unlock()
+			log.Printf("[ModifyOrder] Rejected - kill switch active for session %s, ClientOrderID: %s", session_id, mod.ClientOrderID)
 			return
 		}
 
@@ -252,6 +387,11 @@ func (b *MT5Bridge) CancelOrder(cancel OrderCancellation) {
 		b.ordersMutex.Lock()
 		if !b.isRunning.Load() {
 			b.ordersMutex.Unlock()
+			return
+		}
+		if b.IsKillSwitchActive(session_id) {
+			b.ordersMutex.Unlock()
+			log.Printf("[CancelOrder] Rejected - kill switch active for session %s, ClientOrderID: %s", session_id, cancel.ClientOrderID)
 			return
 		}
 		if info, exists := b.trackingOrders[cancel.ClientOrderID]; exists {
@@ -329,6 +469,9 @@ func (b *MT5Bridge) handleClient(conn net.Conn) {
 
 	log.Printf("[HandleClient] Handshake successful, session: %s", sessionID)
 
+	// Resend kill switch state if EA reconnects
+	b.resendKillSwitchState(sessionID)
+
 	if err := b.startWhileForListening(conn, sessionID); err != nil {
 		log.Printf("[HandleClient] Listen loop ended for %s: %v", sessionID, err)
 		return
@@ -371,6 +514,12 @@ func (b *MT5Bridge) startWhileForListening(conn net.Conn, sessionID string) erro
 
 		case PONG:
 			// Heartbeat - no action needed (reduced logging)
+
+		case KILL_SWITCH:
+			log.Printf("[StartWhileForListening] Received KILL_SWITCH from %s: %s", sessionID, message)
+
+		case KILL_SWITCH_ACK:
+			log.Printf("[StartWhileForListening] Received KILL_SWITCH_ACK from %s: %s", sessionID, message)
 
 		case HELLO:
 			log.Printf("  %s", sessionID)
@@ -553,6 +702,10 @@ func (b *MT5Bridge) parseMessageType(message string) MessageType {
 		return SYMBOLS
 	} else if strings.Contains(message, "ACCOUNT") {
 		return ACCOUNT
+	} else if strings.Contains(message, "KILL_SWITCH") {
+		return KILL_SWITCH
+	} else if strings.Contains(message, "KILL_SWITCH_ACK") {
+		return KILL_SWITCH_ACK
 	}
 	return UNKNOWN
 }
