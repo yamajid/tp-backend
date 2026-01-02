@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -12,36 +13,18 @@ import (
 	"time"
 )
 
-type KillSwitchState int
-
-const (
-	KILL_SWITCH_NORMAL KillSwitchState = iota
-	KILL_SWITCH_HALTED
-	KILL_SWITCH_FLATTENING
-)
-
-func (ks KillSwitchState) String() string {
-	switch ks {
-	case KILL_SWITCH_NORMAL:
-		return "NORMAL"
-	case KILL_SWITCH_HALTED:
-		return "HALTED"
-	case KILL_SWITCH_FLATTENING:
-		return "FLATTENING"
-	default:
-		return "UNKNOWN"
-	}
-}
-
 type MT5Bridge struct {
-	config   PlatformConfig
-	listener net.Listener
+	config      PlatformConfig
+	listener    net.Listener
+	rmsListener net.Listener
 
 	connectedEAs    map[string]net.Conn
 	trackingOrders  map[string]TrackingOrderInfo
 	symbolMetadata  map[string]SymbolInfo  // Stores broker symbol metadata for canonical mapping
 	accountMetadata map[string]AccountInfo // Stores account info from EA
 	sessionMagics   map[string]int64       // Maps session ID to unique magic number
+
+	platformRouter *PlatformRouter // Reference to router for publishing info
 
 	sessionsMutex  sync.RWMutex
 	ordersMutex    sync.RWMutex
@@ -57,20 +40,26 @@ type MT5Bridge struct {
 	wg           sync.WaitGroup
 	magicCounter atomic.Int64
 
-	killSwitchStates map[string]KillSwitchState
-	killSwitchMutex  sync.RWMutex
+	killSwitchStates   map[string]KillSwitchState
+	connectionStatuses map[string]ConnectionStatus
+	killSwitchMutex    sync.RWMutex
 }
 
 func NewMT5Bridge() *MT5Bridge {
 	return &MT5Bridge{
-		connectedEAs:     make(map[string]net.Conn),
-		trackingOrders:   make(map[string]TrackingOrderInfo),
-		symbolMetadata:   make(map[string]SymbolInfo),
-		accountMetadata:  make(map[string]AccountInfo),
-		sessionMagics:    make(map[string]int64),
-		shutdown:         make(chan struct{}),
-		killSwitchStates: make(map[string]KillSwitchState),
+		connectedEAs:       make(map[string]net.Conn),
+		trackingOrders:     make(map[string]TrackingOrderInfo),
+		symbolMetadata:     make(map[string]SymbolInfo),
+		accountMetadata:    make(map[string]AccountInfo),
+		sessionMagics:      make(map[string]int64),
+		shutdown:           make(chan struct{}),
+		killSwitchStates:   make(map[string]KillSwitchState),
+		connectionStatuses: make(map[string]ConnectionStatus),
 	}
+}
+
+func (b *MT5Bridge) SetPlatformRouter(router *PlatformRouter) {
+	b.platformRouter = router
 }
 
 func (b *MT5Bridge) GetMagic(sessionID string) (int64, bool) {
@@ -128,6 +117,31 @@ func (b *MT5Bridge) Connect() {
 	// Start heartbeat goroutine
 	b.wg.Add(1)
 	go b.heartbeat()
+
+	// Start RMS listener
+	rmsAddr := "0.0.0.0:5557"
+	rmsListener, err := net.Listen("tcp", rmsAddr)
+	if err != nil {
+		log.Printf("Failed to start RMS listener: %v", err)
+		return
+	}
+	b.rmsListener = rmsListener
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		for {
+			select {
+			case <-b.shutdown:
+				return
+			default:
+				conn, err := rmsListener.Accept()
+				if err != nil {
+					return
+				}
+				go b.handleRMSConnection(conn)
+			}
+		}
+	}()
 }
 
 func (b *MT5Bridge) Disconnect() {
@@ -139,6 +153,10 @@ func (b *MT5Bridge) Disconnect() {
 
 	if b.listener != nil {
 		b.listener.Close()
+	}
+
+	if b.rmsListener != nil {
+		b.rmsListener.Close()
 	}
 
 	b.sessionsMutex.Lock()
@@ -305,14 +323,16 @@ func (b *MT5Bridge) SendOrder(order Order) {
 		order.Volume,
 		order.Magic,
 	)
+
+	// Check kill switch BEFORE locking (using order.SessionID directly)
+	if b.IsKillSwitchActive(order.SessionID) {
+		log.Printf("[SendOrder] Rejected - kill switch active for session %s, ClientOrderID: %s", order.SessionID, order.ClientOrderID)
+		return
+	}
+
 	b.ordersMutex.Lock()
 	if !b.isRunning.Load() {
 		b.ordersMutex.Unlock()
-		return
-	}
-	if b.IsKillSwitchActive(session_id) {
-		b.ordersMutex.Unlock()
-		log.Printf("[SendOrder] Rejected - kill switch active for session %s, ClientOrderID: %s", session_id, order.ClientOrderID)
 		return
 	}
 	session_id = order.SessionID
@@ -336,14 +356,15 @@ func (b *MT5Bridge) ModifyOrder(mod OrderModification) {
 	var ticket_id uint64
 
 	{
+		// Check kill switch BEFORE locking
+		if b.IsKillSwitchActive(mod.ClientOrderID) {
+			log.Printf("[ModifyOrder] Rejected - kill switch active, ClientOrderID: %s", mod.ClientOrderID)
+			return
+		}
+
 		b.ordersMutex.Lock()
 		if !b.isRunning.Load() {
 			b.ordersMutex.Unlock()
-			return
-		}
-		if b.IsKillSwitchActive(session_id) {
-			b.ordersMutex.Unlock()
-			log.Printf("[ModifyOrder] Rejected - kill switch active for session %s, ClientOrderID: %s", session_id, mod.ClientOrderID)
 			return
 		}
 
@@ -384,14 +405,23 @@ func (b *MT5Bridge) CancelOrder(cancel OrderCancellation) {
 	var ticket_id uint64
 
 	{
+		// Get session from tracking orders first for kill switch check
+		var checkSessionID string
+		b.ordersMutex.RLock()
+		if info, exists := b.trackingOrders[cancel.ClientOrderID]; exists {
+			checkSessionID = info.SessionID
+		}
+		b.ordersMutex.RUnlock()
+
+		// Check kill switch BEFORE main lock
+		if checkSessionID != "" && b.IsKillSwitchActive(checkSessionID) {
+			log.Printf("[CancelOrder] Rejected - kill switch active for session %s, ClientOrderID: %s", checkSessionID, cancel.ClientOrderID)
+			return
+		}
+
 		b.ordersMutex.Lock()
 		if !b.isRunning.Load() {
 			b.ordersMutex.Unlock()
-			return
-		}
-		if b.IsKillSwitchActive(session_id) {
-			b.ordersMutex.Unlock()
-			log.Printf("[CancelOrder] Rejected - kill switch active for session %s, ClientOrderID: %s", session_id, cancel.ClientOrderID)
 			return
 		}
 		if info, exists := b.trackingOrders[cancel.ClientOrderID]; exists {
@@ -541,6 +571,7 @@ func (b *MT5Bridge) handleClient(conn net.Conn) {
 			b.sessionsMutex.Lock()
 			delete(b.connectedEAs, sessionID)
 			delete(b.sessionMagics, sessionID)
+			b.connectionStatuses[sessionID] = DISCONNECTED
 			b.sessionsMutex.Unlock()
 			log.Printf("[HandleClient] Connection closed for session: %s", sessionID)
 		}
@@ -860,23 +891,86 @@ func (b *MT5Bridge) parseHandshakeMessage(message string, conn net.Conn) (string
 	}
 
 	b.sessionsMutex.Lock()
-	if _, exists := b.connectedEAs[sessionID]; exists {
-		b.sessionsMutex.Unlock()
-		return "", fmt.Errorf("session already exists: %s", sessionID)
-	}
 
+	var oldSessionID string
 	if hasMagic {
-		// Use the provided magic
-		b.sessionMagics[sessionID] = magic
-		log.Printf("[ProcessHandshake] Using provided magic %d for session: %s", magic, sessionID)
+		// EA provided magic - check if this is a reconnection
+		// Case 1: Same session ID (EA restarted and kept same SessionID - normal case now)
+		if existingMagic, exists := b.sessionMagics[sessionID]; exists && existingMagic == magic {
+			log.Printf("[ProcessHandshake] Same EA reconnecting: session %s with magic %d", sessionID, magic)
+			// Close old connection if it exists and is different
+			if oldConn, exists := b.connectedEAs[sessionID]; exists && oldConn != conn {
+				log.Printf("[ProcessHandshake] Closing stale connection for session %s", sessionID)
+				oldConn.Close()
+			}
+			// Connection and magic already exist, just update the connection
+			b.connectedEAs[sessionID] = conn
+			b.connectionStatuses[sessionID] = CONNECTED
+		} else {
+			// Case 2: Different session ID but same magic (EA changed SessionID - rare)
+			for oldSessID, oldMagic := range b.sessionMagics {
+				if oldMagic == magic && oldSessID != sessionID {
+					oldSessionID = oldSessID
+					log.Printf("[ProcessHandshake] Detected reconnection: magic %d was session %s, now %s", magic, oldSessionID, sessionID)
+
+					// Migrate old session data to new session ID
+					if oldConn, exists := b.connectedEAs[oldSessionID]; exists {
+						// Close old connection if still active
+						log.Printf("[ProcessHandshake] Closing old connection for session %s", oldSessionID)
+						oldConn.Close()
+						delete(b.connectedEAs, oldSessionID)
+					}
+					delete(b.sessionMagics, oldSessionID)
+					if status, exists := b.connectionStatuses[oldSessionID]; exists {
+						b.connectionStatuses[sessionID] = status
+						delete(b.connectionStatuses, oldSessionID)
+					}
+
+					// Migrate tracking orders from old session to new session
+					b.ordersMutex.Lock()
+					for orderID, trackingInfo := range b.trackingOrders {
+						if trackingInfo.SessionID == oldSessionID {
+							trackingInfo.SessionID = sessionID
+							b.trackingOrders[orderID] = trackingInfo
+							log.Printf("[ProcessHandshake] Migrated order %s from %s to %s", orderID, oldSessionID, sessionID)
+						}
+					}
+					b.ordersMutex.Unlock()
+
+					// Migrate kill switch state
+					b.killSwitchMutex.Lock()
+					if state, exists := b.killSwitchStates[oldSessionID]; exists {
+						b.killSwitchStates[sessionID] = state
+						delete(b.killSwitchStates, oldSessionID)
+					}
+					b.killSwitchMutex.Unlock()
+
+					break
+				}
+			}
+
+			// Use the provided magic
+			b.sessionMagics[sessionID] = magic
+			b.connectedEAs[sessionID] = conn
+			b.connectionStatuses[sessionID] = CONNECTED
+
+			if oldSessionID != "" {
+				log.Printf("[ProcessHandshake] Reconnection: session %s -> %s with magic %d", oldSessionID, sessionID, magic)
+			} else {
+				log.Printf("[ProcessHandshake] Using provided magic %d for session: %s", magic, sessionID)
+			}
+		}
 	} else {
 		// Assign new magic
 		magic = b.magicCounter.Add(1) + 10000
 		b.sessionMagics[sessionID] = magic
+		b.connectedEAs[sessionID] = conn
+		b.connectionStatuses[sessionID] = CONNECTED
 		log.Printf("[ProcessHandshake] Assigned new magic %d to session: %s", magic, sessionID)
 	}
 
 	b.connectedEAs[sessionID] = conn
+	b.connectionStatuses[sessionID] = CONNECTED
 	b.sessionsMutex.Unlock()
 
 	// Send magic to EA only if we assigned a new one
@@ -1127,10 +1221,24 @@ func (b *MT5Bridge) processAccountInfo(sessionID, message string) {
 		}
 	}
 
+	// Get connection status
+	b.sessionsMutex.RLock()
+	status, exists := b.connectionStatuses[sessionID]
+	b.sessionsMutex.RUnlock()
+	if !exists {
+		status = DISCONNECTED
+	}
+	accountInfo.ConnectionStatus = status
+
 	// Store account info
 	b.symbolsMutex.Lock() // Reuse symbolsMutex for account too, or add separate
 	b.accountMetadata[sessionID] = accountInfo
 	b.symbolsMutex.Unlock()
+
+	// Publish to frontend queue
+	if b.platformRouter != nil {
+		b.platformRouter.PublishAccountInfoToQueue(sessionID, accountInfo)
+	}
 
 	// log.Printf("[processAccountInfo] Stored account info from EA %s: Balance=%.2f, Equity=%.2f, Profit=%.2f, Margin=%.2f, MarginFree=%.2f", sessionID, accountInfo.Balance, accountInfo.Equity, accountInfo.Profit, accountInfo.Margin, accountInfo.MarginFree)
 }
@@ -1159,4 +1267,29 @@ func (b *MT5Bridge) ResolveSymbol(canonical string) string {
 	// No match found: return original symbol as fallback
 	log.Printf("[ResolveSymbol] No mapping found for canonical symbol: %s", canonical)
 	return canonical
+}
+
+func (b *MT5Bridge) handleRMSConnection(conn net.Conn) {
+	defer conn.Close()
+	scanner := bufio.NewScanner(conn)
+	for scanner.Scan() {
+		msg := scanner.Text()
+		var data map[string]interface{}
+		json.Unmarshal([]byte(msg), &data)
+		if data["type"] == "KILL_SWITCH" {
+			sessionID := data["session_id"].(string)
+			action := data["action"].(string)
+			switch action {
+			case "HALT":
+				b.Halt(sessionID)
+				conn.Write([]byte("ACK: HALTED\n"))
+			case "FLATTEN":
+				b.FlattenAll(sessionID)
+				conn.Write([]byte("ACK: FLATTENING\n"))
+			case "RESUME":
+				b.Resume(sessionID)
+				conn.Write([]byte("ACK: RESUMED\n"))
+			}
+		}
+	}
 }

@@ -15,6 +15,9 @@ func main() {
 	// Create PlatformRouter (connects to RabbitMQ)
 	platformRouter := NewPlatformRouter(mt5Bridge)
 
+	// Set platform router reference in MT5Bridge
+	mt5Bridge.SetPlatformRouter(platformRouter)
+
 	// Configure MT5Bridge
 	mt5Config := PlatformConfig{
 		Host: "0.0.0.0",

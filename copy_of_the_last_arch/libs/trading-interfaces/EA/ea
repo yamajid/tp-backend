@@ -43,6 +43,10 @@ string stateFile = "ea_state.txt";
 bool killSwitchActive = false;
 string killSwitchState = "NORMAL"; // NORMAL, HALTED, FLATTENING
 
+// Global variable names (unique per chart)
+string GV_SESSION_ID = "";
+string GV_MAGIC = "";
+
 //+------------------------------------------------------------------+
 //| Helper: Ensure symbol is selected and subscribed                 |
 //+------------------------------------------------------------------+
@@ -124,18 +128,55 @@ void SendAccountInfo() {
 int OnInit() {
    Print("=== MT5 Bridge EA Starting ===");
    
-   // Fixed session ID for testing
-   SessionID = "ea_00";
-   Print("Session ID: ", SessionID);
+   // Create unique GlobalVariable names for this chart (symbol + timeframe)
+   string chartID = Symbol() + "_" + IntegerToString(Period());
+   GV_SESSION_ID = "EA_SESSION_ID_" + chartID;
+   GV_MAGIC = "EA_MAGIC_" + chartID;
+   Print("Using GlobalVariable prefix: ", chartID);
    
-   // Load magic number from global variable
-   if(GlobalVariableCheck("MAGIC")) {
-      EAMagic = (long)GlobalVariableGet("MAGIC");
-      Print("Loaded magic number: ", EAMagic);
+   // Load or generate persistent session ID
+   if(GlobalVariableCheck(GV_SESSION_ID)) {
+      SessionID = "ea_" + IntegerToString((int)GlobalVariableGet(GV_SESSION_ID));
+      Print("Loaded existing Session ID: ", SessionID);
+   } else {
+      // Generate new session ID only on first run
+      MathSrand((int)TimeLocal());
+      int randomNum = MathRand();
+      SessionID = "ea_" + IntegerToString(randomNum);
+      GlobalVariableSet(GV_SESSION_ID, randomNum);
+      Print("Generated and saved new Session ID: ", SessionID);
+   }
+   
+   // Load previous magic number (if exists) to maintain continuity
+   if(GlobalVariableCheck(GV_MAGIC)) {
+      EAMagic = (long)GlobalVariableGet(GV_MAGIC);
+      Print("Loaded previous magic number: ", EAMagic);
    } else {
       EAMagic = 0;
-      Print("No magic number found");
+      Print("No previous magic number found - will receive new one from hub");
    }
+   
+   // Initialize CTrade settings (CRITICAL: Must be set before any trade operations)
+   trade.SetDeviationInPoints(10);  // Set price deviation for market orders
+   trade.SetTypeFilling(ORDER_FILLING_FOK);  // Fill or Kill - standard for most brokers
+   trade.SetAsyncMode(false);  // Synchronous mode for better error handling
+   Print("✓ CTrade initialized: Deviation=10 points, Filling=FOK, Mode=Sync");
+   
+   // Detect and display account type (NETTING vs HEDGING)
+   ENUM_ACCOUNT_MARGIN_MODE marginMode = (ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE);
+   string accountType = "";
+   if(marginMode == ACCOUNT_MARGIN_MODE_RETAIL_NETTING) {
+      accountType = "NETTING (One position per symbol)";
+   } else if(marginMode == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING) {
+      accountType = "HEDGING (Multiple positions per symbol)";
+   } else if(marginMode == ACCOUNT_MARGIN_MODE_EXCHANGE) {
+      accountType = "EXCHANGE";
+   } else {
+      accountType = "UNKNOWN";
+   }
+   Print("========================================");
+   Print("   ACCOUNT TYPE: ", accountType);
+   Print("========================================");
    
    // Create socket
    socket = SocketCreate();
@@ -253,6 +294,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
 //+------------------------------------------------------------------+
 void OnTimer() {
    static int saveCounter = 0; // Counter for periodic state saving
+   static int accountInfoCounter = 0; // Counter for account info sending
    
    // Check if socket is still valid
    if(socket == INVALID_HANDLE) {
@@ -269,12 +311,13 @@ void OnTimer() {
                if(SocketConnect(socket, HubAddress, HubPort, 5000)) {
                   Print("Reconnected to MT5 Hub successfully");
                   
-                  // Send HELLO handshake message
+                  // Send HELLO handshake message - reuse existing SessionID and Magic
                   string hello = "HELLO;session_id=" + SessionID;
                   if(EAMagic > 0) {
                      hello += ";magic=" + IntegerToString(EAMagic);
                   }
                   hello += "\n";
+                  Print("Reconnecting with SessionID: ", SessionID, ", Magic: ", EAMagic);
                   if(SendToHub(hello)) {
                      // Send broker symbol metadata and account info
                      SendSymbolMetadata();
@@ -323,16 +366,8 @@ void OnTimer() {
       }
       return;
    }
-      
-   // Check for stale connection (no PING received within timeout)
-   datetime now = TimeCurrent();
-   if(lastPingReceived > 0 && now - lastPingReceived > pingTimeout) {
-      Print("WARNING: No PING received within ", pingTimeout, " seconds, marking connection stale");
-      SocketClose(socket);
-      socket = INVALID_HANDLE;
-   }
    
-   // Check for incoming messages
+   // Check for incoming messages FIRST (process PING before checking timeout)
    uchar buffer[4096];
    uint bytes = SocketIsReadable(socket);
    
@@ -362,8 +397,21 @@ void OnTimer() {
       }
    }
    
-   // Send account info every second
-   SendAccountInfo();
+   // Check for stale connection AFTER processing messages (so PING gets read first)
+   datetime now = TimeCurrent();
+   if(lastPingReceived > 0 && now - lastPingReceived > pingTimeout) {
+      Print("WARNING: No PING received within ", pingTimeout, " seconds, marking connection stale");
+      SocketClose(socket);
+      socket = INVALID_HANDLE;
+      return;
+   }
+   
+   // Send account info every 5 seconds
+   accountInfoCounter++;
+   if(accountInfoCounter >= 5) {
+      SendAccountInfo();
+      accountInfoCounter = 0;
+   }
    
    // Periodic state saving (every 60 seconds)
    saveCounter++;
@@ -408,7 +456,7 @@ void ProcessCommand(string command) {
    if(StringFind(command, "MAGIC|") == 0) {
       long magic = StringToInteger(GetField(command, "magic"));
       EAMagic = magic;
-      GlobalVariableSet("MAGIC", magic);
+      GlobalVariableSet(GV_MAGIC, magic);
       Print("Received and stored magic number: ", magic);
    }
    else if(StringFind(command, "SEND_ORDER|") == 0) {
@@ -456,9 +504,10 @@ bool SendToHub(string message) {
    int sent = SocketSend(socket, buffer, ArraySize(buffer) - 1);
    
    if(sent <= 0) {
-      Print("ERROR: SocketSend failed: ", GetLastError(), " - closing connection");
-      SocketClose(socket);
-      socket = INVALID_HANDLE;
+      int error = GetLastError();
+      Print("WARNING: SocketSend failed: ", error, " (will retry)");
+      // Don't close connection on temporary send failures
+      // Only return false to indicate failure, let caller decide
       return false;
    }
    
@@ -898,64 +947,39 @@ void ProcessCancelOrder(string message) {
 //+------------------------------------------------------------------+
 void ProcessClosePositions(string message) {
    long magic = StringToInteger(GetField(message, "MAGIC"));
-   string symbolFilter = GetField(message, "SYMBOL");
-   string pnlFilter = GetField(message, "PNL");
-   string sideFilter = GetField(message, "SIDE");
-   string scope = GetField(message, "SCOPE");
    
-   Print("Closing positions: Magic=", magic, " Symbol=", symbolFilter, " PnL=", pnlFilter, " Side=", sideFilter, " Scope=", scope);
+   string symbolFilter = GetField(message, "SYMBOL");
+   if(symbolFilter == "") symbolFilter = GetField(message, "symbol");
+   
+   string pnlFilter = GetField(message, "PNL");
+   if(pnlFilter == "") pnlFilter = GetField(message, "pnl");
+   StringToUpper(pnlFilter);
+   
+   string sideFilter = GetField(message, "SIDE");
+   if(sideFilter == "") sideFilter = GetField(message, "side");
+   StringToUpper(sideFilter);
    
    if(magic == 0) {
       Print("ERROR: Invalid magic number");
       return;
    }
    
-   // Debug: List all positions
-   Print("=== DEBUG: All positions ===");
-   for(int i = 0; i < PositionsTotal(); i++) {
-      if(PositionGetTicket(i) > 0) {
-         ulong ticket = PositionGetInteger(POSITION_TICKET);
-         string symbol = PositionGetString(POSITION_SYMBOL);
-         long posMagic = PositionGetInteger(POSITION_MAGIC);
-         double profit = PositionGetDouble(POSITION_PROFIT);
-         int posType = PositionGetInteger(POSITION_TYPE);
-         Print("Position[", i, "]: Ticket=", ticket, " Symbol=", symbol, " Magic=", posMagic, " Profit=", DoubleToString(profit, 2), " Type=", posType);
-      }
-   }
-   Print("=== END DEBUG ===");
+   // Set magic number for trade operations
+   trade.SetExpertMagicNumber(magic);
    
    int closedCount = 0;
    for(int i = PositionsTotal() - 1; i >= 0; i--) {
       if(PositionGetTicket(i) > 0) {
          long posMagic = PositionGetInteger(POSITION_MAGIC);
-         if(posMagic != magic) {
-            Print("Skipping position ", i, " - magic mismatch: ", posMagic, " != ", magic);
-            continue; // Filter by magic
-         }
+         if(posMagic != magic) continue;
          
          // Apply filters
-         if(symbolFilter != "" && PositionGetString(POSITION_SYMBOL) != symbolFilter) {
-            Print("Skipping position ", i, " - symbol filter: ", PositionGetString(POSITION_SYMBOL), " != ", symbolFilter);
-            continue;
-         }
-         if(pnlFilter != "" && pnlFilter == "PROFIT" && PositionGetDouble(POSITION_PROFIT) <= 0) {
-            Print("Skipping position ", i, " - not profit: ", PositionGetDouble(POSITION_PROFIT));
-            continue;
-         }
-         if(pnlFilter != "" && pnlFilter == "LOSS" && PositionGetDouble(POSITION_PROFIT) >= 0) {
-            Print("Skipping position ", i, " - not loss: ", PositionGetDouble(POSITION_PROFIT));
-            continue;
-         }
-         if(sideFilter != "" && sideFilter == "BUY" && PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY) {
-            Print("Skipping position ", i, " - not BUY: ", PositionGetInteger(POSITION_TYPE));
-            continue;
-         }
-         if(sideFilter != "" && sideFilter == "SELL" && PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_SELL) {
-            Print("Skipping position ", i, " - not SELL: ", PositionGetInteger(POSITION_TYPE));
-            continue;
-         }
+         if(symbolFilter != "" && PositionGetString(POSITION_SYMBOL) != symbolFilter) continue;
+         if(pnlFilter != "" && pnlFilter == "PROFIT" && PositionGetDouble(POSITION_PROFIT) <= 0) continue;
+         if(pnlFilter != "" && pnlFilter == "LOSS" && PositionGetDouble(POSITION_PROFIT) >= 0) continue;
+         if(sideFilter != "" && sideFilter == "BUY" && PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY) continue;
+         if(sideFilter != "" && sideFilter == "SELL" && PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_SELL) continue;
          
-         Print("Closing position ", i, " - matches filters");
          // Close position
          ulong ticket = PositionGetInteger(POSITION_TICKET);
          if(trade.PositionClose(ticket)) {
@@ -978,15 +1002,27 @@ void ProcessClosePositions(string message) {
 //+------------------------------------------------------------------+
 void ProcessDeleteOrders(string message) {
    long magic = StringToInteger(GetField(message, "MAGIC"));
+   // Accept both uppercase and lowercase filter keys (PDF compliance)
    string symbolFilter = GetField(message, "SYMBOL");
-   string scope = GetField(message, "SCOPE");
+   if(symbolFilter == "") symbolFilter = GetField(message, "symbol");
    
-   Print("Deleting orders: Magic=", magic, " Symbol=", symbolFilter, " Scope=", scope);
+   string orderTypeFilter = GetField(message, "ORDER_TYPE");
+   if(orderTypeFilter == "") orderTypeFilter = GetField(message, "order_type");
+   StringToUpper(orderTypeFilter);
+   
+   string scope = GetField(message, "SCOPE");
+   if(scope == "") scope = GetField(message, "scope");
+   StringToUpper(scope);
+   
+   Print("Deleting orders: Magic=", magic, " Symbol=", symbolFilter, " OrderType=", orderTypeFilter, " Scope=", scope);
    
    if(magic == 0) {
       Print("ERROR: Invalid magic number");
       return;
    }
+   
+   // Set magic number for trade operations (CRITICAL FIX)
+   trade.SetExpertMagicNumber(magic);
    
    int deletedCount = 0;
    for(int i = OrdersTotal() - 1; i >= 0; i--) {
@@ -996,6 +1032,28 @@ void ProcessDeleteOrders(string message) {
          
          // Apply symbol filter
          if(symbolFilter != "" && OrderGetString(ORDER_SYMBOL) != symbolFilter) continue;
+         
+         // Apply order type filter
+         if(orderTypeFilter != "") {
+            ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+            bool matchesType = false;
+            
+            if(orderTypeFilter == "LIMIT" && (orderType == ORDER_TYPE_BUY_LIMIT || orderType == ORDER_TYPE_SELL_LIMIT)) {
+               matchesType = true;
+            } else if(orderTypeFilter == "STOP" && (orderType == ORDER_TYPE_BUY_STOP || orderType == ORDER_TYPE_SELL_STOP)) {
+               matchesType = true;
+            } else if(orderTypeFilter == "LIMIT_BUY" && orderType == ORDER_TYPE_BUY_LIMIT) {
+               matchesType = true;
+            } else if(orderTypeFilter == "LIMIT_SELL" && orderType == ORDER_TYPE_SELL_LIMIT) {
+               matchesType = true;
+            } else if(orderTypeFilter == "STOP_BUY" && orderType == ORDER_TYPE_BUY_STOP) {
+               matchesType = true;
+            } else if(orderTypeFilter == "STOP_SELL" && orderType == ORDER_TYPE_SELL_STOP) {
+               matchesType = true;
+            }
+            
+            if(!matchesType) continue;
+         }
          
          // Delete order
          ulong ticket = OrderGetTicket(i);
@@ -1020,11 +1078,26 @@ void ProcessDeleteOrders(string message) {
 void ProcessPartialClose(string message) {
    long magic = StringToInteger(GetField(message, "MAGIC"));
    ulong positionID = StringToInteger(GetField(message, "POSITION_ID"));
+   if(positionID == 0) positionID = StringToInteger(GetField(message, "position_id"));
+   
    double closePercent = StringToDouble(GetField(message, "CLOSE_PERCENT"));
+   if(closePercent == 0) closePercent = StringToDouble(GetField(message, "close_percent"));
+   
+   // Accept both uppercase and lowercase filter keys (PDF compliance)
    string symbolFilter = GetField(message, "SYMBOL");
+   if(symbolFilter == "") symbolFilter = GetField(message, "symbol");
+   
    string pnlFilter = GetField(message, "PNL");
+   if(pnlFilter == "") pnlFilter = GetField(message, "pnl");
+   StringToUpper(pnlFilter);
+   
    string sideFilter = GetField(message, "SIDE");
+   if(sideFilter == "") sideFilter = GetField(message, "side");
+   StringToUpper(sideFilter);
+   
    string scope = GetField(message, "SCOPE");
+   if(scope == "") scope = GetField(message, "scope");
+   StringToUpper(scope);
    
    Print("Partial closing positions: Magic=", magic, " PositionID=", positionID, " ClosePercent=", closePercent, " Symbol=", symbolFilter, " PnL=", pnlFilter, " Side=", sideFilter, " Scope=", scope);
    
@@ -1035,14 +1108,15 @@ void ProcessPartialClose(string message) {
       return;
    }
    
+   // Set magic number for trade operations
+   trade.SetExpertMagicNumber(magic);
+   
    int partialClosedCount = 0;
    
    if(positionID > 0) {
-      Print("Checking specific position: ", positionID, " with magic: ", magic);
       // Close specific position
       if(PositionSelectByTicket(positionID)) {
          long posMagic = PositionGetInteger(POSITION_MAGIC);
-         Print("Position found, current magic: ", posMagic, " expected: ", magic);
          if(posMagic == magic) {
             string symbol = PositionGetString(POSITION_SYMBOL);
             double currentVolume = PositionGetDouble(POSITION_VOLUME);
@@ -1051,62 +1125,230 @@ void ProcessPartialClose(string message) {
             // Enforce volume rules
             volumeToClose = NormalizeVolume(symbol, volumeToClose);
             
-            Print("Attempting to close volume: ", volumeToClose, " of ", currentVolume);
-            if(volumeToClose > 0 && trade.PositionClosePartial(positionID, volumeToClose)) {
-               partialClosedCount++;
-               Print("✓ Partial closed position: ", positionID, " Volume: ", volumeToClose);
-            } else {
-               Print("✗ Failed to partial close position: ", positionID, " Error: ", GetLastError());
+            // Validate minimum lot
+            double minLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+            if(volumeToClose < minLot) {
+               Print("✗ Close volume ", volumeToClose, " below minimum lot ", minLot);
+               string ack = "ACK|PARTIAL_CLOSE|COUNT=0|STATUS=ERROR|REASON=MIN_LOT_VIOLATION|\n";
+               SendToHub(ack);
+               return;
             }
-         } else {
-            Print("Magic mismatch: position has ", posMagic, " expected ", magic);
+            
+            // Ensure symbol is properly selected and market data is available
+            if(!EnsureSymbol(symbol)) {
+               Print("✗ Failed to ensure symbol: ", symbol);
+               string ack = "ACK|PARTIAL_CLOSE|COUNT=0|STATUS=ERROR|REASON=SYMBOL_NOT_AVAILABLE|\n";
+               SendToHub(ack);
+               return;
+            }
+            
+            // Set deviation for this operation (critical for market execution)
+            trade.SetDeviationInPoints(10);
+            
+            if(volumeToClose > 0) {
+               // Get current market prices for debugging
+               double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+               double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+               Print("   Market: Bid=", bid, " Ask=", ask, " Spread=", (ask-bid)*MathPow(10, (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS)), " points");
+               
+               // Check if trading is allowed
+               bool tradeAllowed = (bool)SymbolInfoInteger(symbol, SYMBOL_TRADE_MODE);
+               Print("   Trade allowed: ", tradeAllowed, " Market open: ", (bool)SymbolInfoInteger(symbol, SYMBOL_TRADE_MODE));
+               
+               bool success = trade.PositionClosePartial(positionID, volumeToClose);
+               uint retcode = trade.ResultRetcode();
+               int lastError = GetLastError();
+               
+               Print("   DEBUG: success=", success, " retcode=", retcode, " lastError=", lastError);
+               
+               // Check CTrade result code, not GetLastError() (which may be stale)
+               if(success || retcode == TRADE_RETCODE_DONE) {
+                  partialClosedCount++;
+                  Print("✓ Partial closed position: ", positionID, " Volume: ", volumeToClose, " Price: ", trade.ResultPrice());
+                  
+                  // VERIFY: Check position volume after close
+                  Sleep(100); // Brief delay for position update
+                  if(PositionSelectByTicket(positionID)) {
+                     double newVolume = PositionGetDouble(POSITION_VOLUME);
+                     Print("   VERIFY: Position ", positionID, " remaining volume: ", newVolume, " (was: ", currentVolume, ")");
+                     if(newVolume >= currentVolume) {
+                        Print("   WARNING: Volume did not decrease! Account may be HEDGING mode.");
+                        Print("   NOTE: On hedging accounts, partial close creates an opposite position instead of reducing volume.");
+                     }
+                  } else {
+                     Print("   VERIFY: Position ", positionID, " fully closed (no longer exists)");
+                  }
+               } else {
+                  Print("✗ Failed to partial close position: ", positionID);
+                  Print("   ResultRetcode: ", retcode, " Description: ", trade.ResultRetcodeDescription());
+                  Print("   LastError: ", lastError);
+                  Print("   Deal: ", trade.ResultDeal(), " Order: ", trade.ResultOrder());
+                  Print("   Comment: ", trade.ResultComment());
+               }
+            }
          }
-      } else {
-         Print("Position ", positionID, " not found by PositionSelectByTicket");
       }
    } else {
-      Print("Checking all positions for partial close with magic: ", magic);
       // Close all matching positions
-      for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      int totalPositions = PositionsTotal();
+      Print("Total positions in account: ", totalPositions);
+      
+      for(int i = totalPositions - 1; i >= 0; i--) {
          if(PositionGetTicket(i) > 0) {
+            // Capture ALL position data immediately while position is selected
             long posMagic = PositionGetInteger(POSITION_MAGIC);
+            string posSymbol = PositionGetString(POSITION_SYMBOL);
+            double posProfit = PositionGetDouble(POSITION_PROFIT);
+            long posType = PositionGetInteger(POSITION_TYPE);
+            ulong ticket = PositionGetInteger(POSITION_TICKET);
+            double currentVolume = PositionGetDouble(POSITION_VOLUME);
+            
+            Print("Position[", i, "]: Ticket=", ticket, " Symbol=", posSymbol, " Magic=", posMagic, " Volume=", currentVolume);
+            
+            // Filter by magic
             if(posMagic != magic) {
-               Print("Skipping position ", i, " - magic mismatch");
+               Print("  → Skipped: Magic mismatch (", posMagic, " != ", magic, ")");
                continue;
             }
             
-            // Apply filters
-            if(symbolFilter != "" && PositionGetString(POSITION_SYMBOL) != symbolFilter) continue;
-            if(pnlFilter != "" && pnlFilter == "PROFIT" && PositionGetDouble(POSITION_PROFIT) <= 0) continue;
-            if(pnlFilter != "" && pnlFilter == "LOSS" && PositionGetDouble(POSITION_PROFIT) >= 0) continue;
-            if(sideFilter != "" && sideFilter == "BUY" && PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY) continue;
-            if(sideFilter != "" && sideFilter == "SELL" && PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_SELL) continue;
+            // Apply filters (with debugging)
+            if(symbolFilter != "" && posSymbol != symbolFilter) {
+               Print("  → Skipped: Symbol mismatch (", posSymbol, " != ", symbolFilter, ")");
+               continue;
+            }
+            if(pnlFilter != "" && pnlFilter == "PROFIT" && posProfit <= 0) {
+               Print("  → Skipped: PnL filter (PROFIT) but profit=", posProfit);
+               continue;
+            }
+            if(pnlFilter != "" && pnlFilter == "LOSS" && posProfit >= 0) {
+               Print("  → Skipped: PnL filter (LOSS) but profit=", posProfit);
+               continue;
+            }
+            if(sideFilter != "" && sideFilter == "BUY" && posType != POSITION_TYPE_BUY) {
+               Print("  → Skipped: Side filter (BUY) but type=", posType);
+               continue;
+            }
+            if(sideFilter != "" && sideFilter == "SELL" && posType != POSITION_TYPE_SELL) {
+               Print("  → Skipped: Side filter (SELL) but type=", posType);
+               continue;
+            }
             
-            ulong ticket = PositionGetInteger(POSITION_TICKET);
-            string symbol = PositionGetString(POSITION_SYMBOL);
-            double currentVolume = PositionGetDouble(POSITION_VOLUME);
+            Print("  → MATCHED all filters! Proceeding with partial close...");
+            
+            // Calculate volume to close
             double volumeToClose = (closePercent / 100.0) * currentVolume;
             
-            // Ensure symbol is subscribed before closing
-            if(!EnsureSymbol(symbol)) {
-               Print("Skipping position ", ticket, " - symbol not available: ", symbol);
-               continue;
-            }
-            
-            // Reselect position after symbol selection
-            if(!PositionSelectByTicket(ticket)) {
-               Print("Failed to reselect position ", ticket, " after symbol selection");
-               continue;
-            }
-            
             // Enforce volume rules
-            volumeToClose = NormalizeVolume(symbol, volumeToClose);
+            volumeToClose = NormalizeVolume(posSymbol, volumeToClose);
             
-            if(volumeToClose > 0 && trade.PositionClosePartial(ticket, volumeToClose)) {
-               partialClosedCount++;
-               Print("✓ Partial closed position: ", ticket, " Volume: ", volumeToClose);
-            } else {
-               Print("✗ Failed to partial close position: ", ticket);
+            // Validate minimum lot
+            double minLot = SymbolInfoDouble(posSymbol, SYMBOL_VOLUME_MIN);
+            if(volumeToClose < minLot) {
+               Print("✗ Close volume ", volumeToClose, " below minimum lot ", minLot, " for position ", ticket);
+               continue;
+            }
+            
+            if(volumeToClose > 0) {
+               // Ensure symbol is properly selected and market data is available
+               if(!EnsureSymbol(posSymbol)) {
+                  Print("✗ Failed to ensure symbol: ", posSymbol, " for position ", ticket);
+                  continue;
+               }
+               
+               // Set deviation for this operation (critical for market execution)
+               trade.SetDeviationInPoints(10);
+               
+               // Re-select position by ticket to ensure valid context
+               if(!PositionSelectByTicket(ticket)) {
+                  Print("✗ Failed to re-select position: ", ticket, " Error: ", GetLastError());
+                  continue;
+               }
+               
+               // WORKAROUND: Some brokers don't support PositionClosePartial on NETTING accounts
+               // Alternative: Open opposite position to reduce net exposure
+               Print("   Using OPPOSITE POSITION method (broker workaround for NETTING accounts)");
+               
+               bool success = false;
+               uint retcode = 0;
+               
+               // Determine opposite direction
+               if(posType == POSITION_TYPE_BUY) {
+                  // Current position is BUY, open SELL to reduce net
+                  success = trade.Sell(volumeToClose, posSymbol, 0, 0, 0, "PartialClose:" + IntegerToString(ticket));
+               } else {
+                  // Current position is SELL, open BUY to reduce net
+                  success = trade.Buy(volumeToClose, posSymbol, 0, 0, 0, "PartialClose:" + IntegerToString(ticket));
+               }
+               
+               retcode = trade.ResultRetcode();
+               
+               // Check CTrade result code, not GetLastError() (which may be stale)
+               if(success || retcode == TRADE_RETCODE_DONE) {
+                  partialClosedCount++;
+                  
+                  // Get deal information to verify actual execution
+                  ulong dealTicket = trade.ResultDeal();
+                  double dealVolume = 0.0;
+                  if(dealTicket > 0) {
+                     if(HistoryDealSelect(dealTicket)) {
+                        dealVolume = HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
+                     }
+                  }
+                  
+                  Print("✓ Partial close executed: Ticket=", ticket, " RequestVolume=", volumeToClose, " Price=", trade.ResultPrice());
+                  Print("   Deal: ", dealTicket, " DealVolume=", dealVolume, " Order=", trade.ResultOrder());
+                  
+                  // VERIFY: Check NET position volume after close (NETTING account behavior)
+                  Sleep(100); // Brief delay for position update
+                  
+                  // On NETTING accounts, partial close creates opposite position
+                  // Check total net volume for the symbol
+                  double netVolume = 0.0;
+                  bool positionExists = false;
+                  
+                  Print("   Checking all positions for symbol: ", posSymbol);
+                  for(int p = 0; p < PositionsTotal(); p++) {
+                     if(PositionGetTicket(p) > 0) {
+                        if(PositionGetString(POSITION_SYMBOL) == posSymbol) {
+                           double vol = PositionGetDouble(POSITION_VOLUME);
+                           long pType = PositionGetInteger(POSITION_TYPE);
+                           ulong pTicket = PositionGetInteger(POSITION_TICKET);
+                           
+                           if(pType == POSITION_TYPE_BUY) {
+                              netVolume += vol;
+                           } else {
+                              netVolume -= vol;
+                           }
+                           
+                           positionExists = true;
+                           Print("     Position: Ticket=", pTicket, 
+                                 " Type=", (pType == POSITION_TYPE_BUY ? "BUY" : "SELL"), 
+                                 " Volume=", vol);
+                        }
+                     }
+                  }
+                  
+                  netVolume = MathAbs(netVolume); // Get absolute net volume
+                  
+                  if(positionExists) {
+                     Print("   VERIFY: Net position volume for ", posSymbol, ": ", netVolume, " (was: ", currentVolume, ")");
+                     if(netVolume < currentVolume - 0.0001) { // Account for floating point precision
+                        Print("   ✓ SUCCESS: Net volume decreased by ", DoubleToString(currentVolume - netVolume, 2), " lots");
+                     } else {
+                        Print("   ✗ ERROR: Net volume did NOT decrease!");
+                        Print("   ✗ BROKER ISSUE: Trade function returned success but no opposite position created");
+                        Print("   ✗ Possible causes:");
+                        Print("      - Broker doesn't support partial close on NETTING accounts");
+                        Print("      - Account restriction or minimum volume requirement");
+                        Print("      - Check with broker if partial close is enabled for your account");
+                     }
+                  } else {
+                     Print("   VERIFY: All positions for ", posSymbol, " closed");
+                  }
+               } else {
+                  Print("✗ Failed to partial close position: ", ticket);
+                  Print("   ResultRetcode: ", retcode, " Description: ", trade.ResultRetcodeDescription());
+               }
             }
          }
       }
@@ -1132,9 +1374,10 @@ void ProcessKillSwitch(string message) {
    else if(action == "FLATTEN") {
       killSwitchActive = true;
       killSwitchState = "FLATTENING";
-      Print("Kill switch activated: FLATTEN - closing all positions");
+      Print("Kill switch activated: FLATTEN - closing all positions and canceling all orders");
       long magic = StringToInteger(GetField(message, "MAGIC"));
       CloseAllPositions(magic);
+      CancelAllOrders(magic);
    }
    else if(action == "RESUME") {
       killSwitchActive = false;
@@ -1178,4 +1421,34 @@ void CloseAllPositions(long targetMagic) {
    }
    
    Print("Closed ", closedCount, " positions with magic: ", targetMagic);
+}
+
+//+------------------------------------------------------------------+
+//| Cancel all pending orders with specified magic number            |
+//+------------------------------------------------------------------+
+void CancelAllOrders(long targetMagic) {
+   int total = OrdersTotal();
+   int canceledCount = 0;
+   
+   for(int i = total - 1; i >= 0; i--) {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket > 0) {
+         long orderMagic = OrderGetInteger(ORDER_MAGIC);
+         
+         // Only cancel orders with matching magic
+         if(orderMagic == targetMagic) {
+            string symbol = OrderGetString(ORDER_SYMBOL);
+            ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+            
+            if(trade.OrderDelete(ticket)) {
+               canceledCount++;
+               Print("✓ Canceled order: ", ticket, " Symbol: ", symbol, " Type: ", EnumToString(type));
+            } else {
+               Print("✗ Failed to cancel order: ", ticket, " Error: ", GetLastError());
+            }
+         }
+      }
+   }
+    
+   Print("Canceled ", canceledCount, " orders with magic: ", targetMagic);
 }

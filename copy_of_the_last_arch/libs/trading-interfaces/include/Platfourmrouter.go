@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -142,6 +143,11 @@ func (r *PlatformRouter) Start() error {
 	if err != nil {
 		r.cleanup()
 		return fmt.Errorf("failed to bind confirmation queue: %w", err)
+	}
+	_, err = r.publisherChannel.QueueDeclare("q.mt5.account_info", true, false, false, false, nil)
+	if err != nil {
+		r.cleanup()
+		return fmt.Errorf("failed to declare account info queue: %w", err)
 	}
 
 	r.isRunning.Store(true)
@@ -286,6 +292,45 @@ func (r *PlatformRouter) PublishTradeEvent(event TradeEvent) {
 	if err != nil {
 		log.Printf("[PlatformRouter] Error publishing trade event: %v", err)
 	}
+}
+
+func (r *PlatformRouter) PublishAccountInfoToQueue(sessionID string, accountInfo AccountInfo) {
+	r.publisherMutex.Lock()
+	defer r.publisherMutex.Unlock()
+
+	if r.publisherChannel == nil {
+		return
+	}
+
+	// Convert account info to JSON
+	jsonData, err := json.Marshal(map[string]interface{}{
+		"session_id": sessionID,
+		"timestamp":  time.Now().Unix(),
+		"account":    accountInfo,
+	})
+	if err != nil {
+		log.Printf("[PlatformRouter] Error marshaling account info: %v", err)
+		return
+	}
+
+	// Publish directly to the account info queue (using default exchange)
+	err = r.publisherChannel.Publish(
+		"",                   // default exchange
+		"q.mt5.account_info", // routing key = queue name
+		false,                // mandatory
+		false,                // immediate
+		amqp.Publishing{
+			ContentType: "application/json",
+			Body:        jsonData,
+		},
+	)
+
+	if err != nil {
+		log.Printf("[PlatformRouter] Error publishing account info: %v", err)
+		return
+	}
+
+	log.Printf("[PlatformRouter] Published account info for session: %s", sessionID)
 }
 
 func (r *PlatformRouter) ordersConsumer() {
@@ -538,12 +583,15 @@ func (r *PlatformRouter) processPartialClose(jsonData map[string]interface{}, se
 		return fmt.Errorf("no magic assigned for session %s", sessionID)
 	}
 
-	// Extract close percent
-	closePercentFloat, ok := jsonData["close_percent"].(float64)
-	if !ok {
-		return fmt.Errorf("missing or invalid close_percent for PARTIAL_CLOSE")
+	// Extract close percent (try close_pct first per PDF spec, fallback to close_percent for compatibility)
+	var closePercent float64
+	if closePercentFloat, ok := jsonData["close_pct"].(float64); ok {
+		closePercent = closePercentFloat
+	} else if closePercentFloat, ok := jsonData["close_percent"].(float64); ok {
+		closePercent = closePercentFloat
+	} else {
+		return fmt.Errorf("missing or invalid close_pct/close_percent for PARTIAL_CLOSE")
 	}
-	closePercent := closePercentFloat
 
 	// Extract position ID (optional)
 	var positionID string

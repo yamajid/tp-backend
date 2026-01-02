@@ -59,6 +59,27 @@ func (ot OrderType) String() string {
 	}
 }
 
+type KillSwitchState int
+
+const (
+	KILL_SWITCH_NORMAL KillSwitchState = iota
+	KILL_SWITCH_HALTED
+	KILL_SWITCH_FLATTENING
+)
+
+func (ks KillSwitchState) String() string {
+	switch ks {
+	case KILL_SWITCH_NORMAL:
+		return "NORMAL"
+	case KILL_SWITCH_HALTED:
+		return "HALTED"
+	case KILL_SWITCH_FLATTENING:
+		return "FLATTENING"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 // ConfirmationStatus represents order confirmation status
 type ConfirmationStatus int
 
@@ -157,11 +178,12 @@ type SymbolInfo struct {
 
 // AccountInfo stores account information from EA
 type AccountInfo struct {
-	Balance    float64 // Account balance
-	Equity     float64 // Account equity
-	Profit     float64 // Floating P/L
-	Margin     float64 // Used margin
-	MarginFree float64 // Free margin
+	Balance          float64          // Account balance
+	Equity           float64          // Account equity
+	Profit           float64          // Floating P/L
+	Margin           float64          // Used margin
+	MarginFree       float64          // Free margin
+	ConnectionStatus ConnectionStatus // Current connection status of the EA
 }
 
 // OrderState represents whether ticket is an order or position
