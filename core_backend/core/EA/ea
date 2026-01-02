@@ -1,0 +1,1323 @@
+//+------------------------------------------------------------------+
+//|                                          simple_trade_bridge.mq5 |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025"
+#property version   "2.10"
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Generic\HashMap.mqh>
+CTrade trade;
+
+// MT5 Hub connection settings
+string HubAddress = "127.0.0.1";
+int HubPort = 5556;
+
+// Session ID - unique identifier for this EA instance
+string SessionID = "";
+
+// Magic number for this EA instance
+long EAMagic = 0;
+
+// Socket handle
+int socket = INVALID_HANDLE;
+
+// Receive buffer for handling partial messages
+string receiveBuffer = "";
+
+
+// Reconnection variables
+int reconnectionAttempts = 0;
+int maxReconnectionAttempts = 5;
+datetime lastConnectionAttempt = 0;
+int backoffDelay = 1; // Initial backoff delay in seconds
+
+// Heartbeat monitoring variables
+datetime lastPingReceived = 0;
+int pingTimeout = 30; // Timeout for PING reception in seconds
+
+// State persistence
+string stateFile = "ea_state.txt";
+
+// Kill switch state
+bool killSwitchActive = false;
+string killSwitchState = "NORMAL"; // NORMAL, HALTED, FLATTENING
+
+// Global variable names (unique per chart)
+string GV_SESSION_ID = "";
+string GV_MAGIC = "";
+
+//+------------------------------------------------------------------+
+//| Helper: Ensure symbol is selected and subscribed                 |
+//+------------------------------------------------------------------+
+bool EnsureSymbol(string symbol) {
+   // Try to select the symbol
+   if(!SymbolSelect(symbol, true)) {
+      int error = GetLastError();
+      Print("ERROR: Failed to select symbol: ", symbol, " (Error: ", error, ")");
+      
+      // List similar symbols to help diagnose
+      Print("  Searching for similar symbols...");
+      int total = SymbolsTotal(false);  // All symbols in Market Watch
+      int found = 0;
+      for(int i = 0; i < total && found < 5; i++) {
+         string available = SymbolName(i, false);
+         if(StringFind(available, StringSubstr(symbol, 0, 3)) >= 0) {
+            Print("    - Found in Market Watch: ", available);
+            found++;
+         }
+      }
+      
+      if(found == 0) {
+         Print("  No similar symbols in Market Watch. Checking all broker symbols...");
+         int totalAll = SymbolsTotal(true);  // All available from broker
+         for(int i = 0; i < totalAll && found < 5; i++) {
+            string available = SymbolName(i, true);
+            if(StringFind(available, StringSubstr(symbol, 0, 3)) >= 0) {
+               Print("    - Available from broker: ", available, " (not in Market Watch)");
+               found++;
+            }
+         }
+      }
+      
+      return false;
+   }
+   
+   // Verify symbol is visible
+   if(!SymbolInfoInteger(symbol, SYMBOL_SELECT)) {
+      Print("ERROR: Symbol not available: ", symbol);
+      return false;
+   }
+   
+   Print("✓ Symbol verified: ", symbol);
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Send broker symbol metadata to hub (PDF requirement)             |
+//+------------------------------------------------------------------+
+void SendSymbolMetadata() {
+   int total = SymbolsTotal(true);
+   string metadata = "SYMBOLS|SESSION_ID=" + SessionID + "|DATA=[";
+   int count = 0;
+   
+   for(int i = 0; i < total; i++) {
+      string symbol = SymbolName(i, true);
+      if(StringLen(symbol) == 0) continue;
+      
+      string path = SymbolInfoString(symbol, SYMBOL_PATH);
+      string description = SymbolInfoString(symbol, SYMBOL_DESCRIPTION);
+      double contractSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_CONTRACT_SIZE);
+      
+      if(count > 0) metadata += ",";
+      
+      metadata += "{SYMBOL=" + symbol + 
+                  "|PATH=" + path + 
+                  "|DESC=" + description + 
+                  "|CONTRACT=" + DoubleToString(contractSize, 2) + "}";
+      count++;
+   }
+   
+   metadata += "]|\n";
+   SendToHub(metadata);
+}
+
+//+------------------------------------------------------------------+
+//| Send account info to hub                                         |
+//+------------------------------------------------------------------+
+void SendAccountInfo() {
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double profit = AccountInfoDouble(ACCOUNT_PROFIT);
+   double margin = AccountInfoDouble(ACCOUNT_MARGIN);
+   double margin_free = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   
+   string accountData = "ACCOUNT|SESSION_ID=" + SessionID + 
+                       "|BALANCE=" + DoubleToString(balance, 2) +
+                       "|EQUITY=" + DoubleToString(equity, 2) +
+                       "|PROFIT=" + DoubleToString(profit, 2) +
+                       "|MARGIN=" + DoubleToString(margin, 2) +
+                       "|MARGIN_FREE=" + DoubleToString(margin_free, 2) + "|\n";
+   
+   SendToHub(accountData);
+    // Print("✓ Sent account info: Balance=", DoubleToString(balance, 2), ", Equity=", DoubleToString(equity, 2));
+}
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit() {
+   Print("=== MT5 Bridge EA Starting ===");
+   
+   // Create unique GlobalVariable names for this chart (symbol + timeframe)
+   string chartID = Symbol() + "_" + IntegerToString(Period());
+   GV_SESSION_ID = "EA_SESSION_ID_" + chartID;
+   GV_MAGIC = "EA_MAGIC_" + chartID;
+   Print("Using GlobalVariable prefix: ", chartID);
+   
+   // Load or generate persistent session ID
+   if(GlobalVariableCheck(GV_SESSION_ID)) {
+      SessionID = "ea_" + IntegerToString((int)GlobalVariableGet(GV_SESSION_ID));
+      Print("Loaded existing Session ID: ", SessionID);
+   } else {
+      // Generate new session ID only on first run
+      MathSrand((int)TimeLocal());
+      int randomNum = MathRand();
+      SessionID = "ea_" + IntegerToString(randomNum);
+      GlobalVariableSet(GV_SESSION_ID, randomNum);
+      Print("Generated and saved new Session ID: ", SessionID);
+   }
+   
+   // Load previous magic number (if exists) to maintain continuity
+   if(GlobalVariableCheck(GV_MAGIC)) {
+      EAMagic = (long)GlobalVariableGet(GV_MAGIC);
+      Print("Loaded previous magic number: ", EAMagic);
+   } else {
+      EAMagic = 0;
+      Print("No previous magic number found - will receive new one from hub");
+   }
+   
+   // Initialize CTrade settings (CRITICAL: Must be set before any trade operations)
+   trade.SetDeviationInPoints(10);  // Set price deviation for market orders
+   trade.SetTypeFilling(ORDER_FILLING_FOK);  // Fill or Kill - standard for most brokers
+   trade.SetAsyncMode(false);  // Synchronous mode for better error handling
+   Print("✓ CTrade initialized: Deviation=10 points, Filling=FOK, Mode=Sync");
+   
+   // Detect and display account type (NETTING vs HEDGING)
+   ENUM_ACCOUNT_MARGIN_MODE marginMode = (ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE);
+   string accountType = "";
+   if(marginMode == ACCOUNT_MARGIN_MODE_RETAIL_NETTING) {
+      accountType = "NETTING (One position per symbol)";
+   } else if(marginMode == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING) {
+      accountType = "HEDGING (Multiple positions per symbol)";
+   } else if(marginMode == ACCOUNT_MARGIN_MODE_EXCHANGE) {
+      accountType = "EXCHANGE";
+   } else {
+      accountType = "UNKNOWN";
+   }
+   Print("========================================");
+   Print("   ACCOUNT TYPE: ", accountType);
+   Print("========================================");
+   
+   // Create socket
+   socket = SocketCreate();
+   if(socket == INVALID_HANDLE) {
+      Print("ERROR: Failed to create socket: ", GetLastError());
+      return INIT_FAILED;
+   }
+   
+   // Connect to MT5 Hub
+   Print("Connecting to MT5 Hub at ", HubAddress, ":", HubPort);
+   if(!SocketConnect(socket, HubAddress, HubPort, 5000)) {
+      Print("ERROR: Failed to connect to MT5 Hub: ", GetLastError());
+      SocketClose(socket);
+      return INIT_FAILED;
+   }
+   
+   Print("Connected to MT5 Hub successfully");
+   
+   // Send HELLO handshake message
+   string hello = "HELLO;session_id=" + SessionID;
+   if(EAMagic > 0) {
+      hello += ";magic=" + IntegerToString(EAMagic);
+   }
+   hello += "\n";
+   if(!SendToHub(hello)) {
+      Print("ERROR: Failed to send HELLO handshake");
+      SocketClose(socket);
+      return INIT_FAILED;
+   }
+   
+   Print("Handshake sent.");
+   
+   // Send broker symbol metadata to hub (PDF requirement)
+   SendSymbolMetadata();
+   
+   // Send account info to hub
+   SendAccountInfo();
+   
+   Print("EA is ready to receive orders.");
+   
+   // Initialize heartbeat
+   lastPingReceived = TimeCurrent();
+   
+   // Load previous state if available
+   LoadState();
+   
+   // Start timer to check for hub messages (every 100ms for responsiveness)
+   EventSetTimer(1);
+   
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason) {
+   Print("=== MT5 Bridge EA Stopping ===");
+   Print("Reason: ", reason);
+   
+   // Close socket
+   if(socket != INVALID_HANDLE) {
+      SocketClose(socket);
+      socket = INVALID_HANDLE;
+   }
+   
+   EventKillTimer();
+   Print("EA stopped successfully");
+}
+
+//+------------------------------------------------------------------+
+//| Trade transaction event handler                                  |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction& trans,
+                       const MqlTradeRequest& request,
+                       const MqlTradeResult& result) {
+   
+   // Detect when pending order is filled and becomes position
+   if(trans.type == TRADE_TRANSACTION_ORDER_DELETE && 
+      trans.order_state == ORDER_STATE_FILLED) {
+      
+      // Get the original order to extract ClientOrderID from comment
+      if(OrderSelect(trans.order)) {
+         string comment = OrderGetString(ORDER_COMMENT);
+         string clientOrderId = "";
+         
+         // Extract ClientOrderID from comment "Order:BENCH_abc123"
+         if(StringFind(comment, "Order:") == 0) {
+            clientOrderId = StringSubstr(comment, 6); // Skip "Order:"
+         }
+         
+         if(StringLen(clientOrderId) > 0 && trans.position > 0) {
+            // Send state change notification to hub
+            string stateChange = "STATE_CHANGE|SESSION_ID=" + SessionID +
+                               "|CLIENT_ORDER_ID=" + clientOrderId +
+                               "|OLD_TICKET=" + IntegerToString(trans.order) +
+                               "|NEW_TICKET=" + IntegerToString(trans.position) +
+                               "|NEW_STATE=POSITION|\n";
+            
+            SendToHub(stateChange);
+            Print("→ Order→Position transition: ", clientOrderId, 
+                  " Ticket ", trans.order, "→", trans.position);
+         }
+      }
+   }
+   
+   // Save state after any trade transaction
+   SaveState();
+   
+   // Update account info after any trade transaction
+   // SendAccountInfo();  // Removed: now sent every second in OnTimer()
+}
+
+//+------------------------------------------------------------------+
+//| Timer function - polls for incoming messages from hub            |
+//+------------------------------------------------------------------+
+void OnTimer() {
+   static int saveCounter = 0; // Counter for periodic state saving
+   static int accountInfoCounter = 0; // Counter for account info sending
+   
+   // Check if socket is still valid
+   if(socket == INVALID_HANDLE) {
+      // Attempt reconnection with exponential backoff
+      datetime now = TimeCurrent();
+      if(now - lastConnectionAttempt >= backoffDelay) {
+         if(reconnectionAttempts < maxReconnectionAttempts) {
+            Print("Attempting reconnection... Attempt ", reconnectionAttempts + 1, "/", maxReconnectionAttempts);
+            
+            // Create socket
+            socket = SocketCreate();
+            if(socket != INVALID_HANDLE) {
+               // Connect to MT5 Hub
+               if(SocketConnect(socket, HubAddress, HubPort, 5000)) {
+                  Print("Reconnected to MT5 Hub successfully");
+                  
+                  // Send HELLO handshake message - reuse existing SessionID and Magic
+                  string hello = "HELLO;session_id=" + SessionID;
+                  if(EAMagic > 0) {
+                     hello += ";magic=" + IntegerToString(EAMagic);
+                  }
+                  hello += "\n";
+                  Print("Reconnecting with SessionID: ", SessionID, ", Magic: ", EAMagic);
+                  if(SendToHub(hello)) {
+                     // Send broker symbol metadata and account info
+                     SendSymbolMetadata();
+                     SendAccountInfo();
+                     
+                     // Reset reconnection variables
+                     reconnectionAttempts = 0;
+                     backoffDelay = 1; // Reset to 1 second
+                     
+                     // Initialize heartbeat
+                     lastPingReceived = now;
+                     
+                     // Load state after reconnection
+                     LoadState();
+                     
+                     // Send reconnection acknowledgment
+                     string reconnectAck = "RECONNECTED|SESSION_ID=" + SessionID + "|STATUS=OK|\n";
+                     SendToHub(reconnectAck);
+                     
+                     Print("Reconnection complete, EA ready to receive orders");
+                  } else {
+                     Print("ERROR: Failed to send HELLO on reconnection");
+                     SocketClose(socket);
+                     socket = INVALID_HANDLE;
+                  }
+               } else {
+                  Print("ERROR: Failed to reconnect to MT5 Hub: ", GetLastError());
+                  SocketClose(socket);
+                  socket = INVALID_HANDLE;
+               }
+            } else {
+               Print("ERROR: Failed to create socket for reconnection: ", GetLastError());
+            }
+            
+            if(socket == INVALID_HANDLE) {
+               reconnectionAttempts++;
+               backoffDelay = MathMin(backoffDelay * 2, 300); // Exponential backoff, max 5 minutes
+               Print("Reconnection failed, attempt ", reconnectionAttempts, "/", maxReconnectionAttempts, 
+                     ", next attempt in ", backoffDelay, " seconds");
+            }
+            
+            lastConnectionAttempt = now;
+         } else {
+            Print("Max reconnection attempts reached (", maxReconnectionAttempts, "), stopping reconnection attempts");
+         }
+      }
+      return;
+   }
+   
+   // Check for incoming messages FIRST (process PING before checking timeout)
+   uchar buffer[4096];
+   uint bytes = SocketIsReadable(socket);
+   
+   if(bytes > 0) {
+      int received = SocketRead(socket, buffer, MathMin(bytes, 4095), 100);
+      
+      if(received > 0) {
+         buffer[received] = 0; // Null terminate
+         string chunk = CharArrayToString(buffer);
+         
+         // Append to receive buffer
+         receiveBuffer += chunk;
+         
+         // Process all complete messages (separated by \n)
+         ProcessMessages();
+      }
+      else if(received == 0) {
+         Print("WARNING: Hub closed connection");
+         SocketClose(socket);
+         socket = INVALID_HANDLE;
+         // Reconnection will be attempted on next OnTimer call
+      }
+      else {
+         Print("ERROR: SocketRead error: ", GetLastError(), " - closing connection");
+         SocketClose(socket);
+         socket = INVALID_HANDLE;
+      }
+   }
+   
+   // Check for stale connection AFTER processing messages (so PING gets read first)
+   datetime now = TimeCurrent();
+   if(lastPingReceived > 0 && now - lastPingReceived > pingTimeout) {
+      Print("WARNING: No PING received within ", pingTimeout, " seconds, marking connection stale");
+      SocketClose(socket);
+      socket = INVALID_HANDLE;
+      return;
+   }
+   
+   // Send account info every 1 second
+   accountInfoCounter++;
+   if(accountInfoCounter >= 1) {
+      SendAccountInfo();
+      accountInfoCounter = 0;
+   }
+   
+   // Periodic state saving (every 60 seconds)
+   saveCounter++;
+   if(saveCounter >= 60) {
+      SaveState();
+      saveCounter = 0;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Process all complete messages in the receive buffer              |
+//+------------------------------------------------------------------+
+void ProcessMessages() {
+   int pos = StringFind(receiveBuffer, "\n");
+   
+   while(pos >= 0) {
+      // Extract one complete message
+      string message = StringSubstr(receiveBuffer, 0, pos);
+      
+      // Remove processed message from buffer
+      receiveBuffer = StringSubstr(receiveBuffer, pos + 1);
+      
+      // Trim whitespace
+      StringTrimLeft(message);
+      StringTrimRight(message);
+      
+      if(StringLen(message) > 0) {
+         Print("← Received: ", message);
+         ProcessCommand(message);
+      }
+      
+      // Look for next message
+      pos = StringFind(receiveBuffer, "\n");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Process command from MT5 Hub                                     |
+//+------------------------------------------------------------------+
+void ProcessCommand(string command) {
+   // Identify message type
+   if(StringFind(command, "MAGIC|") == 0) {
+      long magic = StringToInteger(GetField(command, "magic"));
+      EAMagic = magic;
+      GlobalVariableSet(GV_MAGIC, magic);
+      Print("Received and stored magic number: ", magic);
+   }
+   else if(StringFind(command, "SEND_ORDER|") == 0) {
+      ProcessSendOrder(command);
+   }
+   else if(StringFind(command, "MODIFY_ORDER|") == 0) {
+      ProcessModifyOrder(command);
+   }
+   else if(StringFind(command, "CANCEL_ORDER|") == 0) {
+      ProcessCancelOrder(command);
+   }
+   else if(StringFind(command, "CLOSE_POSITIONS|") == 0) {
+      ProcessClosePositions(command);
+   }
+   else if(StringFind(command, "DELETE_ORDERS|") == 0) {
+      ProcessDeleteOrders(command);
+   }
+   else if(StringFind(command, "PARTIAL_CLOSE|") == 0) {
+      ProcessPartialClose(command);
+   }
+   else if(StringFind(command, "KILL_SWITCH|") == 0) {
+      ProcessKillSwitch(command);
+   }
+   else if(StringFind(command, "PING") == 0) {
+      // Respond to heartbeat and update last ping time
+      lastPingReceived = TimeCurrent();
+      SendToHub("PONG\n");
+   }
+   else {
+      Print("WARNING: Unknown command type: ", command);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Helper: Send message to hub                                      |
+//+------------------------------------------------------------------+
+bool SendToHub(string message) {
+   if(socket == INVALID_HANDLE) {
+      Print("ERROR: Cannot send - socket invalid");
+      return false;
+   }
+   
+   uchar buffer[];
+   StringToCharArray(message, buffer);
+   int sent = SocketSend(socket, buffer, ArraySize(buffer) - 1);
+   
+   if(sent <= 0) {
+      int error = GetLastError();
+      Print("WARNING: SocketSend failed: ", error, " (will retry)");
+      // Don't close connection on temporary send failures
+      // Only return false to indicate failure, let caller decide
+      return false;
+   }
+   
+   // Print("→ Sent: ", message);
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Helper: Parse key=value fields from message                      |
+//+------------------------------------------------------------------+
+string GetField(string message, string key) {
+   int start = StringFind(message, key + "=");
+   if(start == -1) return "";
+   start += StringLen(key) + 1; // Skip key and =
+   int end = StringFind(message, "|", start);
+   if(end == -1) end = StringLen(message);
+   return StringSubstr(message, start, end - start);
+}
+
+//+------------------------------------------------------------------+
+//| Send confirmation message to hub                                 |
+//+------------------------------------------------------------------+
+void SendConfirmation(string clientOrderId, string status, ulong ticket = 0, 
+                      double filledPrice = 0.0, string reason = "", 
+                      int errorCode = 0, string orderState = "") {
+   string confirmation = "CONFIRMATION|SESSION_ID=" + SessionID + 
+                         "|CLIENT_ORDER_ID=" + clientOrderId +
+                         "|STATUS=" + status;
+   
+   if(ticket > 0)
+      confirmation += "|TICKET=" + IntegerToString(ticket);
+   
+   if(filledPrice > 0.0)
+      confirmation += "|FILLED_PRICE=" + DoubleToString(filledPrice, 5);
+   
+   if(StringLen(orderState) > 0)
+      confirmation += "|ORDER_STATE=" + orderState;
+   
+   if(StringLen(reason) > 0)
+      confirmation += "|REASON=" + reason;
+   
+   if(errorCode != 0)
+      confirmation += "|ERROR_CODE=" + IntegerToString(errorCode);
+   
+   confirmation += "|\n";
+   
+   SendToHub(confirmation);
+}
+
+//+------------------------------------------------------------------+
+//| Helper: Normalize volume to symbol's lot rules                  |
+//+------------------------------------------------------------------+
+double NormalizeVolume(string symbol, double volume) {
+   double minLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+   
+   if(volume < minLot) return 0;
+   if(volume > maxLot) volume = maxLot;
+   
+   // Round to lot step
+   volume = MathRound(volume / lotStep) * lotStep;
+   
+   if(volume < minLot) return 0;
+   
+   return volume;
+}
+
+//+------------------------------------------------------------------+
+//| Save current state to file                                       |
+//+------------------------------------------------------------------+
+void SaveState() {
+   int file = FileOpen(stateFile, FILE_WRITE | FILE_TXT);
+   if(file == INVALID_HANDLE) {
+      Print("ERROR: Cannot open state file for writing: ", stateFile);
+      return;
+   }
+   
+   // Save timestamp
+   FileWrite(file, "TIMESTAMP=" + TimeToString(TimeCurrent()));
+   
+   // Save account info
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   FileWrite(file, "ACCOUNT|BALANCE=" + DoubleToString(balance, 2) + "|EQUITY=" + DoubleToString(equity, 2));
+   
+   // Save positions
+   int posTotal = PositionsTotal();
+   string posData = "POSITIONS|COUNT=" + IntegerToString(posTotal);
+   for(int i = 0; i < posTotal; i++) {
+      if(PositionGetTicket(i) > 0) {
+         ulong ticket = PositionGetInteger(POSITION_TICKET);
+         string symbol = PositionGetString(POSITION_SYMBOL);
+         double volume = PositionGetDouble(POSITION_VOLUME);
+         long magic = PositionGetInteger(POSITION_MAGIC);
+         posData += "|" + IntegerToString(ticket) + "," + symbol + "," + DoubleToString(volume, 2) + "," + IntegerToString(magic);
+      }
+   }
+   FileWrite(file, posData);
+   
+   // Save orders
+   int ordTotal = OrdersTotal();
+   string ordData = "ORDERS|COUNT=" + IntegerToString(ordTotal);
+   for(int i = 0; i < ordTotal; i++) {
+      if(OrderGetTicket(i) > 0) {
+         ulong ticket = OrderGetInteger(ORDER_TICKET);
+         string symbol = OrderGetString(ORDER_SYMBOL);
+         double volume = OrderGetDouble(ORDER_VOLUME_INITIAL);
+         long magic = OrderGetInteger(ORDER_MAGIC);
+         ordData += "|" + IntegerToString(ticket) + "," + symbol + "," + DoubleToString(volume, 2) + "," + IntegerToString(magic);
+      }
+   }
+   FileWrite(file, ordData);
+   
+   // Save kill switch state
+   FileWrite(file, "KILL_SWITCH|STATE=" + killSwitchState + "|ACTIVE=" + (killSwitchActive ? "1" : "0"));
+   
+   FileClose(file);
+   Print("State saved to ", stateFile);
+}
+
+//+------------------------------------------------------------------+
+//| Load state from file                                             |
+//+------------------------------------------------------------------+
+void LoadState() {
+   if(!FileIsExist(stateFile)) {
+      Print("State file not found: ", stateFile);
+      return;
+   }
+   
+   int file = FileOpen(stateFile, FILE_READ | FILE_TXT);
+   if(file == INVALID_HANDLE) {
+      Print("ERROR: Cannot open state file for reading: ", stateFile);
+      return;
+   }
+   
+   string line;
+   while(!FileIsEnding(file)) {
+      line = FileReadString(file);
+      if(StringFind(line, "TIMESTAMP=") == 0) {
+         // Optional: check timestamp
+      }
+      else if(StringFind(line, "ACCOUNT|") == 0) {
+         // Parse account, but not used for now
+      }
+      else if(StringFind(line, "POSITIONS|") == 0) {
+         // Parse positions count, etc.
+         Print("Loaded positions data: ", line);
+      }
+      else if(StringFind(line, "ORDERS|") == 0) {
+         // Parse orders
+         Print("Loaded orders data: ", line);
+      }
+      else if(StringFind(line, "KILL_SWITCH|") == 0) {
+         killSwitchState = GetField(line, "STATE");
+         killSwitchActive = (GetField(line, "ACTIVE") == "1");
+         Print("Loaded kill switch state: ", killSwitchState, " Active: ", killSwitchActive);
+      }
+   }
+   
+   FileClose(file);
+   Print("State loaded from ", stateFile);
+}
+
+//+------------------------------------------------------------------+
+//| Process SEND_ORDER command                                       |
+//+------------------------------------------------------------------+
+void ProcessSendOrder(string message) {
+   string clientOrderId = GetField(message, "CLIENT_ORDER_ID");
+   string symbol = GetField(message, "SYMBOL");
+   string orderTypeStr = GetField(message, "ORDER_TYPE");
+   double volume = StringToDouble(GetField(message, "VOLUME"));
+   double price = StringToDouble(GetField(message, "PRICE"));
+   double sl = StringToDouble(GetField(message, "SL"));
+   double tp = StringToDouble(GetField(message, "TP"));
+   long magic = StringToInteger(GetField(message, "MAGIC"));
+   
+   Print("Processing order: ", clientOrderId, " ", orderTypeStr, " ", symbol, " ", volume, " Magic: ", magic);
+   
+   // Validate inputs
+   if(StringLen(clientOrderId) == 0 || StringLen(symbol) == 0 || volume <= 0.0 || magic == 0) {
+      SendConfirmation(clientOrderId, "REJECTED", 0, 0.0, "Invalid order parameters or magic number");
+      return;
+   }
+   
+   // Ensure symbol is subscribed before trading
+   if(!EnsureSymbol(symbol)) {
+      SendConfirmation(clientOrderId, "REJECTED", 0, 0.0, "Symbol not available: " + symbol);
+      return;
+   }
+   
+   // Check kill switch
+   if(killSwitchActive) {
+      SendConfirmation(clientOrderId, "REJECTED", 0, 0.0, "Kill switch active - order rejected");
+      return;
+   }
+   
+   // Set magic number for this trade
+   trade.SetExpertMagicNumber(magic);
+   
+   // Execute order based on type
+   bool result = false;
+   
+   if(orderTypeStr == "MARKET_BUY") {
+      result = trade.Buy(volume, symbol, 0, sl, tp, "Order:" + clientOrderId);
+   }
+   else if(orderTypeStr == "MARKET_SELL") {
+      result = trade.Sell(volume, symbol, 0, sl, tp, "Order:" + clientOrderId);
+   }
+   else if(orderTypeStr == "LIMIT_BUY") {
+      result = trade.BuyLimit(volume, price, symbol, sl, tp, ORDER_TIME_GTC, 0, "Order:" + clientOrderId);
+   }
+   else if(orderTypeStr == "LIMIT_SELL") {
+      result = trade.SellLimit(volume, price, symbol, sl, tp, ORDER_TIME_GTC, 0, "Order:" + clientOrderId);
+   }
+   else if(orderTypeStr == "STOP_BUY") {
+      result = trade.BuyStop(volume, price, symbol, sl, tp, ORDER_TIME_GTC, 0, "Order:" + clientOrderId);
+   }
+   else if(orderTypeStr == "STOP_SELL") {
+      result = trade.SellStop(volume, price, symbol, sl, tp, ORDER_TIME_GTC, 0, "Order:" + clientOrderId);
+   }
+   else {
+      SendConfirmation(clientOrderId, "REJECTED", 0, 0.0, "Unknown order type: " + orderTypeStr);
+      return;
+   }
+   
+   // Send confirmation
+   if(result) {
+      ulong ticket = 0;
+      double filledPrice = trade.ResultPrice();
+      string orderState = "";
+      
+      // For market orders, get the position ticket by selecting the most recent position
+      if(orderTypeStr == "MARKET_BUY" || orderTypeStr == "MARKET_SELL") {
+         // Find position by symbol and comment
+         string searchComment = "Order:" + clientOrderId;
+         for(int i = PositionsTotal() - 1; i >= 0; i--) {
+            if(PositionGetTicket(i) > 0) {
+               if(PositionGetString(POSITION_SYMBOL) == symbol && 
+                  StringFind(PositionGetString(POSITION_COMMENT), clientOrderId) >= 0) {
+                  ticket = PositionGetInteger(POSITION_TICKET);
+                  break;
+               }
+            }
+         }
+         // Fallback to deal ticket if position not found
+         if(ticket == 0) ticket = trade.ResultDeal();
+         
+         orderState = "POSITION";
+      }
+      else {
+         // For pending orders, use order ticket
+         ticket = trade.ResultOrder();
+         orderState = "ORDER";
+      }
+      
+      Print("✓ Order executed successfully. Ticket: ", ticket, " State: ", orderState, " (Deal: ", trade.ResultDeal(), ", Order: ", trade.ResultOrder(), ")");
+      SendConfirmation(clientOrderId, "FILLED", ticket, filledPrice, "", 0, orderState);
+   }
+   else {
+      int errorCode = GetLastError();
+      string errorDesc = trade.ResultRetcodeDescription();
+      
+      Print("✗ Order failed: ", errorDesc, " (", errorCode, ")");
+      SendConfirmation(clientOrderId, "REJECTED", 0, 0.0, errorDesc, errorCode);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Process MODIFY_ORDER command                                     |
+//+------------------------------------------------------------------+
+void ProcessModifyOrder(string message) {
+   string clientOrderId = GetField(message, "CLIENT_ORDER_ID");
+   ulong ticket = StringToInteger(GetField(message, "TICKET_ID"));
+   
+   double newSL = -1.0;
+   double newTP = -1.0;
+   string slStr = GetField(message, "SL");
+   if (slStr != "") {
+      newSL = StringToDouble(slStr);
+   }
+   string tpStr = GetField(message, "TP");
+   if (tpStr != "") {
+      newTP = StringToDouble(tpStr);
+   }
+   
+   if(ticket == 0) {
+      SendConfirmation(clientOrderId, "REJECTED", 0, 0.0, "Invalid ticket ID");
+      return;
+   }
+   
+   // Check kill switch
+   if(killSwitchActive) {
+      SendConfirmation(clientOrderId, "REJECTED", 0, 0.0, "Kill switch active - modify rejected");
+      return;
+   }
+   
+   bool result = false;
+   string orderState = "";
+   
+   // Check if it's an open position
+   if(PositionSelectByTicket(ticket)) {
+      string posSymbol = PositionGetString(POSITION_SYMBOL);
+      
+      // Ensure symbol is subscribed before modifying
+      if(!EnsureSymbol(posSymbol)) {
+         SendConfirmation(clientOrderId, "REJECTED", ticket, 0.0, "Symbol not available: " + posSymbol);
+         return;
+      }
+      
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double currentTP = PositionGetDouble(POSITION_TP);
+      double modifySL = (newSL != -1.0) ? newSL : currentSL;
+      double modifyTP = (newTP != -1.0) ? newTP : currentTP;
+      
+      result = trade.PositionModify(ticket, modifySL, modifyTP);
+      orderState = "POSITION";
+   }
+   // Check if it's a pending order
+   else if(OrderSelect(ticket)) {
+      // Get current order info
+      string orderSymbol = OrderGetString(ORDER_SYMBOL);
+      double orderPrice = OrderGetDouble(ORDER_PRICE_OPEN);
+      ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      datetime expiration = (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION);
+      
+      // Ensure symbol is subscribed before modifying
+      if(!EnsureSymbol(orderSymbol)) {
+         SendConfirmation(clientOrderId, "REJECTED", ticket, 0.0, "Symbol not available: " + orderSymbol);
+         return;
+      }
+      
+      // Modify pending order (price, SL, TP)
+      result = trade.OrderModify(ticket, orderPrice, newSL, newTP, ORDER_TIME_GTC, expiration);
+      orderState = "ORDER";
+   }
+   else {
+      SendConfirmation(clientOrderId, "REJECTED", ticket, 0.0, "Ticket not found");
+      return;
+   }
+   
+   if(result) {
+      SendConfirmation(clientOrderId, "MODIFIED", ticket, 0.0, "Order/Position modified", 0, orderState);
+   }
+   else {
+      SendConfirmation(clientOrderId, "REJECTED", ticket, 0.0, trade.ResultRetcodeDescription(), GetLastError());
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Process CANCEL_ORDER command                                     |
+//+------------------------------------------------------------------+
+void ProcessCancelOrder(string message) {
+   string clientOrderId = GetField(message, "CLIENT_ORDER_ID");
+   ulong ticket = StringToInteger(GetField(message, "TICKET_ID"));
+   
+   Print("Canceling order: ", clientOrderId, " Ticket: ", ticket);
+   
+   if(ticket == 0) {
+      SendConfirmation(clientOrderId, "REJECTED", 0, 0.0, "Invalid ticket ID");
+      return;
+   }
+   
+   // Check kill switch
+   if(killSwitchActive) {
+      SendConfirmation(clientOrderId, "REJECTED", 0, 0.0, "Kill switch active - cancel rejected");
+      return;
+   }
+   
+   bool result = false;
+   string orderState = "";
+   
+   // Check if it's an open position - close it
+   if(PositionSelectByTicket(ticket)) {
+      string posSymbol = PositionGetString(POSITION_SYMBOL);
+      
+      // Ensure symbol is subscribed before closing
+      if(!EnsureSymbol(posSymbol)) {
+         SendConfirmation(clientOrderId, "REJECTED", ticket, 0.0, "Symbol not available: " + posSymbol);
+         return;
+      }
+      
+      result = trade.PositionClose(ticket);
+      orderState = "POSITION";
+   }
+   // Check if it's a pending order - delete it
+   else if(OrderSelect(ticket)) {
+      string orderSymbol = OrderGetString(ORDER_SYMBOL);
+      
+      // Ensure symbol is subscribed before deleting
+      if(!EnsureSymbol(orderSymbol)) {
+         SendConfirmation(clientOrderId, "REJECTED", ticket, 0.0, "Symbol not available: " + orderSymbol);
+         return;
+      }
+      
+      result = trade.OrderDelete(ticket);
+      orderState = "ORDER";
+   }
+   else {
+      SendConfirmation(clientOrderId, "REJECTED", ticket, 0.0, "Ticket not found");
+      return;
+   }
+   
+   if(result) {
+      Print("✓ ", (orderState == "POSITION" ? "Position closed" : "Order deleted"), " successfully. State: ", orderState);
+      SendConfirmation(clientOrderId, "CANCELED", ticket, 0.0, (orderState == "POSITION" ? "Position closed" : "Order deleted"), 0, orderState);
+   }
+   else {
+      string errorDesc = trade.ResultRetcodeDescription();
+      Print("✗ ", (orderState == "POSITION" ? "Close position" : "Delete order"), " failed: ", errorDesc);
+      SendConfirmation(clientOrderId, "REJECTED", ticket, 0.0, errorDesc, GetLastError());
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Process CLOSE_POSITIONS command                                  |
+//+------------------------------------------------------------------+
+void ProcessClosePositions(string message) {
+   long magic = StringToInteger(GetField(message, "MAGIC"));
+   
+   string symbolFilter = GetField(message, "SYMBOL");
+   if(symbolFilter == "") symbolFilter = GetField(message, "symbol");
+   
+   string pnlFilter = GetField(message, "PNL");
+   if(pnlFilter == "") pnlFilter = GetField(message, "pnl");
+   StringToUpper(pnlFilter);
+   
+   string sideFilter = GetField(message, "SIDE");
+   if(sideFilter == "") sideFilter = GetField(message, "side");
+   StringToUpper(sideFilter);
+   
+   if(magic == 0) {
+      Print("ERROR: Invalid magic number");
+      return;
+   }
+   
+   // Set magic number for trade operations
+   trade.SetExpertMagicNumber(magic);
+   
+   int closedCount = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      if(PositionGetTicket(i) > 0) {
+         long posMagic = PositionGetInteger(POSITION_MAGIC);
+         if(posMagic != magic) continue;
+         
+         // Apply filters
+         if(symbolFilter != "" && PositionGetString(POSITION_SYMBOL) != symbolFilter) continue;
+         if(pnlFilter != "" && pnlFilter == "PROFIT" && PositionGetDouble(POSITION_PROFIT) <= 0) continue;
+         if(pnlFilter != "" && pnlFilter == "LOSS" && PositionGetDouble(POSITION_PROFIT) >= 0) continue;
+         if(sideFilter != "" && sideFilter == "BUY" && PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY) continue;
+         if(sideFilter != "" && sideFilter == "SELL" && PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_SELL) continue;
+         
+         // Close position
+         ulong ticket = PositionGetInteger(POSITION_TICKET);
+         if(trade.PositionClose(ticket)) {
+            closedCount++;
+            Print("✓ Closed position: ", ticket);
+         } else {
+            Print("✗ Failed to close position: ", ticket);
+         }
+      }
+   }
+   
+   // Send acknowledgment
+   string ack = "ACK|CLOSE_POSITIONS|COUNT=" + IntegerToString(closedCount) + "|STATUS=OK|\n";
+   SendToHub(ack);
+   Print("Sent close acknowledgment: ", closedCount, " positions closed");
+}
+
+//+------------------------------------------------------------------+
+//| Process DELETE_ORDERS command                                    |
+//+------------------------------------------------------------------+
+void ProcessDeleteOrders(string message) {
+   long magic = StringToInteger(GetField(message, "MAGIC"));
+   // Accept both uppercase and lowercase filter keys (PDF compliance)
+   string symbolFilter = GetField(message, "SYMBOL");
+   if(symbolFilter == "") symbolFilter = GetField(message, "symbol");
+   
+   string orderTypeFilter = GetField(message, "ORDER_TYPE");
+   if(orderTypeFilter == "") orderTypeFilter = GetField(message, "order_type");
+   StringToUpper(orderTypeFilter);
+   
+   string scope = GetField(message, "SCOPE");
+   if(scope == "") scope = GetField(message, "scope");
+   StringToUpper(scope);
+   
+   Print("Deleting orders: Magic=", magic, " Symbol=", symbolFilter, " OrderType=", orderTypeFilter, " Scope=", scope);
+   
+   if(magic == 0) {
+      Print("ERROR: Invalid magic number");
+      return;
+   }
+   
+   // Set magic number for trade operations (CRITICAL FIX)
+   trade.SetExpertMagicNumber(magic);
+   
+   int deletedCount = 0;
+   for(int i = OrdersTotal() - 1; i >= 0; i--) {
+      if(OrderGetTicket(i) > 0) {
+         long orderMagic = OrderGetInteger(ORDER_MAGIC);
+         if(orderMagic != magic) continue; // Filter by magic
+         
+         // Apply symbol filter
+         if(symbolFilter != "" && OrderGetString(ORDER_SYMBOL) != symbolFilter) continue;
+         
+         // Apply order type filter
+         if(orderTypeFilter != "") {
+            ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+            bool matchesType = false;
+            
+            if(orderTypeFilter == "LIMIT" && (orderType == ORDER_TYPE_BUY_LIMIT || orderType == ORDER_TYPE_SELL_LIMIT)) {
+               matchesType = true;
+            } else if(orderTypeFilter == "STOP" && (orderType == ORDER_TYPE_BUY_STOP || orderType == ORDER_TYPE_SELL_STOP)) {
+               matchesType = true;
+            } else if(orderTypeFilter == "LIMIT_BUY" && orderType == ORDER_TYPE_BUY_LIMIT) {
+               matchesType = true;
+            } else if(orderTypeFilter == "LIMIT_SELL" && orderType == ORDER_TYPE_SELL_LIMIT) {
+               matchesType = true;
+            } else if(orderTypeFilter == "STOP_BUY" && orderType == ORDER_TYPE_BUY_STOP) {
+               matchesType = true;
+            } else if(orderTypeFilter == "STOP_SELL" && orderType == ORDER_TYPE_SELL_STOP) {
+               matchesType = true;
+            }
+            
+            if(!matchesType) continue;
+         }
+         
+         // Delete order
+         ulong ticket = OrderGetTicket(i);
+         if(trade.OrderDelete(ticket)) {
+            deletedCount++;
+            Print("✓ Deleted order: ", ticket);
+         } else {
+            Print("✗ Failed to delete order: ", ticket);
+         }
+      }
+   }
+   
+   // Send acknowledgment
+   string ack = "ACK|DELETE_ORDERS|COUNT=" + IntegerToString(deletedCount) + "|STATUS=OK|\n";
+   SendToHub(ack);
+   Print("Sent delete acknowledgment: ", deletedCount, " orders deleted");
+}
+
+//+------------------------------------------------------------------+
+//| Process PARTIAL_CLOSE command                                    |
+//+------------------------------------------------------------------+
+void ProcessPartialClose(string message) {
+   long magic = StringToInteger(GetField(message, "MAGIC"));
+   ulong positionID = StringToInteger(GetField(message, "POSITION_ID"));
+   if(positionID == 0) positionID = StringToInteger(GetField(message, "position_id"));
+   
+   double closePercent = StringToDouble(GetField(message, "CLOSE_PERCENT"));
+   if(closePercent == 0) closePercent = StringToDouble(GetField(message, "close_percent"));
+   
+   // Accept both uppercase and lowercase filter keys (PDF compliance)
+   string symbolFilter = GetField(message, "SYMBOL");
+   if(symbolFilter == "") symbolFilter = GetField(message, "symbol");
+   
+   string pnlFilter = GetField(message, "PNL");
+   if(pnlFilter == "") pnlFilter = GetField(message, "pnl");
+   StringToUpper(pnlFilter);
+   
+   string sideFilter = GetField(message, "SIDE");
+   if(sideFilter == "") sideFilter = GetField(message, "side");
+   StringToUpper(sideFilter);
+   
+   string scope = GetField(message, "SCOPE");
+   if(scope == "") scope = GetField(message, "scope");
+   StringToUpper(scope);
+   
+   Print("Partial closing positions: Magic=", magic, " PositionID=", positionID, " ClosePercent=", closePercent, " Symbol=", symbolFilter, " PnL=", pnlFilter, " Side=", sideFilter, " Scope=", scope);
+   
+   if(magic == 0 || closePercent <= 0 || closePercent > 100) {
+      Print("ERROR: Invalid magic or close percent");
+      string ack = "ACK|PARTIAL_CLOSE|COUNT=0|STATUS=ERROR|REASON=Invalid parameters|\n";
+      SendToHub(ack);
+      return;
+   }
+   
+   // Set magic number for trade operations
+   trade.SetExpertMagicNumber(magic);
+   
+   int partialClosedCount = 0;
+   
+   if(positionID > 0) {
+      // Close specific position
+      if(PositionSelectByTicket(positionID)) {
+         long posMagic = PositionGetInteger(POSITION_MAGIC);
+         if(posMagic == magic) {
+            string symbol = PositionGetString(POSITION_SYMBOL);
+            double currentVolume = PositionGetDouble(POSITION_VOLUME);
+            double volumeToClose = (closePercent / 100.0) * currentVolume;
+            
+            // Enforce volume rules
+            volumeToClose = NormalizeVolume(symbol, volumeToClose);
+            
+            // Validate minimum lot
+            double minLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+            if(volumeToClose < minLot) {
+               Print("✗ Close volume ", volumeToClose, " below minimum lot ", minLot);
+               string ack = "ACK|PARTIAL_CLOSE|COUNT=0|STATUS=ERROR|REASON=MIN_LOT_VIOLATION|\n";
+               SendToHub(ack);
+               return;
+            }
+            
+            // Ensure symbol is properly selected and market data is available
+            if(!EnsureSymbol(symbol)) {
+               Print("✗ Failed to ensure symbol: ", symbol);
+               string ack = "ACK|PARTIAL_CLOSE|COUNT=0|STATUS=ERROR|REASON=SYMBOL_NOT_AVAILABLE|\n";
+               SendToHub(ack);
+               return;
+            }
+            
+            // Set deviation for this operation (critical for market execution)
+            trade.SetDeviationInPoints(10);
+            
+            if(volumeToClose > 0) {
+               if(trade.PositionClosePartial(positionID, volumeToClose)) {
+                  partialClosedCount++;
+            }
+         }
+      }
+   } else {
+      // Close all matching positions
+      for(int i = PositionsTotal() - 1; i >= 0; i--) {
+         if(PositionGetTicket(i) > 0) {
+            // Capture ALL position data immediately while position is selected
+            long posMagic = PositionGetInteger(POSITION_MAGIC);
+            string posSymbol = PositionGetString(POSITION_SYMBOL);
+            double posProfit = PositionGetDouble(POSITION_PROFIT);
+            long posType = PositionGetInteger(POSITION_TYPE);
+            ulong ticket = PositionGetInteger(POSITION_TICKET);
+            double currentVolume = PositionGetDouble(POSITION_VOLUME);
+            
+            // Filter by magic
+            if(posMagic != magic) continue;
+            
+            // Apply filters
+            if(symbolFilter != "" && posSymbol != symbolFilter) continue;
+            if(pnlFilter != "" && pnlFilter == "PROFIT" && posProfit <= 0) continue;
+            if(pnlFilter != "" && pnlFilter == "LOSS" && posProfit >= 0) continue;
+            if(sideFilter != "" && sideFilter == "BUY" && posType != POSITION_TYPE_BUY) continue;
+            if(sideFilter != "" && sideFilter == "SELL" && posType != POSITION_TYPE_SELL) continue;
+            
+            // Calculate volume to close
+            double volumeToClose = (closePercent / 100.0) * currentVolume;
+            
+            // Enforce volume rules
+            volumeToClose = NormalizeVolume(posSymbol, volumeToClose);
+            
+            // Validate minimum lot
+            double minLot = SymbolInfoDouble(posSymbol, SYMBOL_VOLUME_MIN);
+            if(volumeToClose < minLot) {
+               Print("✗ Close volume ", volumeToClose, " below minimum lot ", minLot, " for position ", ticket);
+               continue;
+            }
+            
+            if(volumeToClose > 0) {
+               // Ensure symbol is properly selected and market data is available
+               if(!EnsureSymbol(posSymbol)) {
+                  Print("✗ Failed to ensure symbol: ", posSymbol, " for position ", ticket);
+                  continue;
+               }
+               
+               // Set deviation for this operation (critical for market execution)
+               trade.SetDeviationInPoints(10);
+               
+               // Re-select position by ticket to ensure valid context
+               if(!PositionSelectByTicket(ticket)) continue;
+               
+               bool success = false;
+               uint retcode = 0;
+               
+               // Determine opposite direction
+               if(posType == POSITION_TYPE_BUY) {
+                  // Current position is BUY, open SELL to reduce net
+                  success = trade.Sell(volumeToClose, posSymbol, 0, 0, 0, "PartialClose:" + IntegerToString(ticket));
+               } else {
+                  // Current position is SELL, open BUY to reduce net
+                  success = trade.Buy(volumeToClose, posSymbol, 0, 0, 0, "PartialClose:" + IntegerToString(ticket));
+               }
+               
+               retcode = trade.ResultRetcode();
+               
+               // Check CTrade result code
+               if(success || retcode == TRADE_RETCODE_DONE) {
+                  partialClosedCount++;
+               }
+            }
+         }
+      }
+   }
+   
+   // Send acknowledgment
+   string ack = "ACK|PARTIAL_CLOSE|COUNT=" + IntegerToString(partialClosedCount) + "|STATUS=OK|\n";
+   SendToHub(ack);
+   Print("Sent partial close acknowledgment: ", partialClosedCount, " positions partial closed");
+}
+
+//+------------------------------------------------------------------+
+//| Process kill switch command                                      |
+//+------------------------------------------------------------------+
+void ProcessKillSwitch(string message) {
+   string action = GetField(message, "ACTION");
+   
+   if(action == "HALT") {
+      killSwitchActive = true;
+      killSwitchState = "HALTED";
+      Print("Kill switch activated: HALT - rejecting new orders");
+   }
+   else if(action == "FLATTEN") {
+      killSwitchActive = true;
+      killSwitchState = "FLATTENING";
+      Print("Kill switch activated: FLATTEN - closing all positions and canceling all orders");
+      long magic = StringToInteger(GetField(message, "MAGIC"));
+      CloseAllPositions(magic);
+      CancelAllOrders(magic);
+   }
+   else if(action == "RESUME") {
+      killSwitchActive = false;
+      killSwitchState = "NORMAL";
+      Print("Kill switch deactivated: RESUME - normal trading resumed");
+   }
+   else {
+      Print("WARNING: Unknown kill switch action: ", action);
+   }
+   
+   // Send acknowledgment
+   string ack = "KILL_SWITCH_ACK|STATE=" + killSwitchState + "|STATUS=OK|\n";
+   SendToHub(ack);
+}
+
+//+------------------------------------------------------------------+
+//| Close all positions with specified magic number                  |
+//+------------------------------------------------------------------+
+void CloseAllPositions(long targetMagic) {
+   int total = PositionsTotal();
+   int closedCount = 0;
+   
+   for(int i = total - 1; i >= 0; i--) {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0) {
+         long posMagic = PositionGetInteger(POSITION_MAGIC);
+         
+         // Only close positions with matching magic
+         if(posMagic == targetMagic) {
+            string symbol = PositionGetString(POSITION_SYMBOL);
+            ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+            
+            if(trade.PositionClose(ticket)) {
+               closedCount++;
+               Print("✓ Closed position: ", ticket, " Symbol: ", symbol, " Type: ", EnumToString(type));
+            } else {
+               Print("✗ Failed to close position: ", ticket, " Error: ", GetLastError());
+            }
+         }
+      }
+   }
+   
+   Print("Closed ", closedCount, " positions with magic: ", targetMagic);
+}
+
+//+------------------------------------------------------------------+
+//| Cancel all pending orders with specified magic number            |
+//+------------------------------------------------------------------+
+void CancelAllOrders(long targetMagic) {
+   int total = OrdersTotal();
+   int canceledCount = 0;
+   
+   for(int i = total - 1; i >= 0; i--) {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket > 0) {
+         long orderMagic = OrderGetInteger(ORDER_MAGIC);
+         
+         // Only cancel orders with matching magic
+         if(orderMagic == targetMagic) {
+            string symbol = OrderGetString(ORDER_SYMBOL);
+            ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+            
+            if(trade.OrderDelete(ticket)) {
+               canceledCount++;
+               Print("✓ Canceled order: ", ticket, " Symbol: ", symbol, " Type: ", EnumToString(type));
+            } else {
+               Print("✗ Failed to cancel order: ", ticket, " Error: ", GetLastError());
+            }
+         }
+      }
+   }
+    
+   Print("Canceled ", canceledCount, " orders with magic: ", targetMagic);
+}
